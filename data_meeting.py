@@ -44,7 +44,9 @@ def process_input(path):
     topic_segment = None
     topic_segments = []
 
-    for line in lines:
+    last_line_idx = len(lines) - 1
+
+    for ln, line in enumerate(lines):
         items = line.strip().split('\t')
         # topic segmentation line
         if items[0] == 'topic_segment':
@@ -73,6 +75,10 @@ def process_input(path):
             encoded_words = bert_tokenizer.encode(text)
             utterance = Utterance(encoded_words, dialogueact, speakerid, extsum_label)
             topic_segment.add_utterance(utterance)
+
+            if ln == last_line_idx:
+                topic_segments.append(topic_segment)
+
     return topic_segments
 
 def process_summary(path):
@@ -115,13 +121,14 @@ def get_ami_data(dir, data_type, style):
 
     return ami_data
 
-ami_dir = "/home/alta/summary/pm574/data/amicorpus/summary_work/v-191203"
-train_data = get_ami_data(ami_dir, data_type='train', style='manual') # len = 94
-valid_data = get_ami_data(ami_dir, data_type='valid', style='manual') # len = 20
-test_data  = get_ami_data(ami_dir, data_type='test',  style='manual') # len = 20
+if __name__ == "__main__":
+    ami_dir = "/home/alta/summary/pm574/data/amicorpus/summary_work/v-191203"
+    train_data = get_ami_data(ami_dir, data_type='train', style='manual') # len = 94
+    valid_data = get_ami_data(ami_dir, data_type='valid', style='manual') # len = 20
+    test_data  = get_ami_data(ami_dir, data_type='test',  style='manual') # len = 20
 
-with open("lib/model_data/ami-191203.train.pk.bin", "wb") as f: pickle.dump(train_data, f)
-with open("lib/model_data/ami-191203.valid.pk.bin", "wb") as f: pickle.dump(valid_data, f)
-with open("lib/model_data/ami-191203.test.pk.bin", "wb") as f: pickle.dump(test_data, f)
+    with open("lib/model_data/ami-191206.train.pk.bin", "wb") as f: pickle.dump(train_data, f)
+    with open("lib/model_data/ami-191206.valid.pk.bin", "wb") as f: pickle.dump(valid_data, f)
+    with open("lib/model_data/ami-191206.test.pk.bin", "wb") as f: pickle.dump(test_data, f)
 
-pdb.set_trace()
+    print("process data finished")
