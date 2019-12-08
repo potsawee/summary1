@@ -24,9 +24,21 @@ def train1():
     args['embedding_dim']  = 256   # word embeeding dimension
     args['rnn_hidden_size'] = 300 # RNN hidden size
 
+    args['batch_size']      = 1
     args['update_nbatches'] = 2
-    args['learning_rate']   = 0.1
+    args['num_epochs']      = 1000
     args['random_seed']     = 28
+    args['best_val_loss']     = 1e+10
+    args['val_batch_size']    = 4
+    args['val_stop_training'] = 10
+
+    args['lr']        = 0.1
+    args['adjust_lr'] = True # if True overwrite the learning rate above
+    args['initial_lr'] = 0.1 # lr = lr_0*step^(-decay_rate)
+    args['decay_rate'] = 0.5
+
+    args['model_save_dir'] = "/home/alta/summary/pm574/summariser1/lib/trained_models/"
+    args['model_name'] = 'HGRU_DEC8A'
     # ---------------------------------------------------------------------------------- #
 
     if args['use_gpu']:
@@ -56,13 +68,21 @@ def train1():
     print(model)
 
     # Hyperparameters
-    BATCH_SIZE = 2
-    NUM_EPOCHS = 1000
+    BATCH_SIZE = args['batch_size']
+    NUM_EPOCHS = args['num_epochs']
+    VAL_BATCH_SIZE = args['val_batch_size']
+    VAL_STOP_TRAINING = args['val_stop_training']
 
     criterion = nn.NLLLoss(reduction='none')
 
     # we use two separate optimisers (encoder & decoder)
-    optimizer = optim.Adam(model.parameters(),lr=args['learning_rate'],betas=(0.9,0.999),eps=1e-08,weight_decay=0)
+    optimizer = optim.Adam(model.parameters(),lr=args['lr'],betas=(0.9,0.999),eps=1e-08,weight_decay=0)
+    optimizer.zero_grad()
+
+    # validation losses
+    best_val_loss = args['best_val_loss']
+    best_epoch    = 0
+    stop_counter  = 0
 
     for epoch in range(NUM_EPOCHS):
         print("======================= Training epoch {} =======================".format(epoch))
@@ -71,13 +91,17 @@ def train1():
         num_batches = int(num_train_data/BATCH_SIZE)
         print("num_batches = {}".format(num_batches))
 
+        print("shuffle train data")
         random.shuffle(train_data)
 
         idx = 0
 
         for bn in range(num_batches):
 
-            input, u_len, w_len, target, tgt_len = get_a_batch(train_data,idx,BATCH_SIZE,args['num_utterances'],args['num_words'],args['summary_length'],device)
+            input, u_len, w_len, target, tgt_len = get_a_batch(
+                    train_data, idx, BATCH_SIZE,
+                    args['num_utterances'], args['num_words'],
+                    args['summary_length'], device)
 
             # decoder target
             decoder_target, decoder_mask = shift_decoder_target(target, tgt_len, device)
@@ -93,8 +117,12 @@ def train1():
             idx += BATCH_SIZE
 
             if bn % args['update_nbatches'] == 0:
+                # gradient_clipping
+                max_norm = 0.5
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm)
                 # update the gradients
-                adjust_lr(optimizer, epoch, num_batches, bn)
+                if args['adjust_lr']:
+                    adjust_lr(optimizer, epoch, num_batches, bn, args['initial_lr'], args['decay_rate'])
                 optimizer.step()
                 optimizer.zero_grad()
 
@@ -102,20 +130,89 @@ def train1():
                 print("[{}] batch number {}/{}: loss = {}".format(str(datetime.now()), bn, num_batches, loss))
                 sys.stdout.flush()
 
-            if bn % 5 == 0:
-                print("Learning Rate = {}".format(optimizer.param_groups[0]['lr']))
+            if bn % 10 == 0:
+
                 print("======================== GENERATED SUMMARY ========================")
                 print(bert_tokenizer.decode(torch.argmax(decoder_output[0], dim=-1).cpu().numpy()[:tgt_len[0]]))
                 print("======================== REFERENCE SUMMARY ========================")
                 print(bert_tokenizer.decode(decoder_target.view(BATCH_SIZE,args['summary_length'])[0,:tgt_len[0]].cpu().numpy()))
 
+            if bn == 0: # e.g. eval every epoch
+                # ---------------- Evaluate the model on validation data ---------------- #
+                print("Evaluating the model at epoch {} step {}".format(epoch, bn))
+                print("learning_rate = {}".format(optimizer.param_groups[0]['lr']))
+                model.eval() # switch to evaluation mode
+                with torch.no_grad():
+                    avg_val_loss = evaluate(model, valid_data, VAL_BATCH_SIZE, args, device)
+                print("avg_val_loss_per_token = {}".format(avg_val_loss))
+                model.train() # switch to training mode
+                # ------------------- Save the model OR Stop training ------------------- #
+                if avg_val_loss < best_val_loss:
+                    stop_counter = 0
+                    best_val_loss = avg_val_loss
+                    best_epoch = epoch
+                    savepath = args['model_save_dir']+"model-{}-ep{}.pt".format(args['model_name'],epoch)
+                    torch.save(model.state_dict(), savepath)
+                    print("Model improved & saved at {}".format(savepath))
+                else:
+                    print("Model not improved #{}".format(stop_counter))
+                    if stop_counter < VAL_STOP_TRAINING:
+                        # load the previous model
+                        latest_model = args['model_save_dir']+"model-{}-ep{}.pt".format(args['model_name'],best_epoch)
+                        model.load_state_dict(torch.load(latest_model))
+                        model.train()
+                        print("Restored model from {}".format(latest_model))
+                        stop_counter += 1
+
+                    else:
+                        print("Model has not improved for {} times! Stop training.".format(VAL_STOP_TRAINING))
     print("End of training hierarchical RNN model")
 
-def adjust_lr(optimizer, epoch, epoch_size, bn):
+def evaluate(model, eval_data, eval_batch_size, args, device):
+    # num_eval_epochs = int(eval_data['num_data']/eval_batch_size) + 1
+    num_eval_epochs = int(len(eval_data)/eval_batch_size)
+
+    print("num_eval_epochs = {}".format(num_eval_epochs))
+
+    eval_idx = 0
+    eval_total_loss = 0.0
+    eval_total_tokens = 0
+
+    criterion = nn.NLLLoss(reduction='none')
+
+    for bn in range(num_eval_epochs):
+
+        input, u_len, w_len, target, tgt_len = get_a_batch(
+                eval_data, eval_idx, eval_batch_size,
+                args['num_utterances'], args['num_words'],
+                args['summary_length'], device)
+
+        # decoder target
+        decoder_target, decoder_mask = shift_decoder_target(target, tgt_len, device)
+        decoder_target = decoder_target.view(-1)
+        decoder_mask = decoder_mask.view(-1)
+
+        decoder_output = model(input, u_len, w_len, target)
+
+        loss = criterion(decoder_output.view(-1, args['vocab_size']), decoder_target)
+        eval_total_loss += (loss * decoder_mask).sum().item()
+        eval_total_tokens += decoder_mask.sum().item()
+
+        eval_idx += eval_batch_size
+
+        print("#", end="")
+        sys.stdout.flush()
+
+    print()
+    avg_eval_loss = eval_total_loss / eval_total_tokens
+    return avg_eval_loss
+
+
+def adjust_lr(optimizer, epoch, epoch_size, bn, lr0, decay_rate):
     """to adjust the learning rate for both encoder & decoder"""
     step = (epoch * epoch_size) + bn + 1 # plus 1 to avoid ZeroDivisionError
     # lr = min(1e-3, 0.05*step**(-1.25))
-    lr = 0.8*step**(-0.5)
+    lr = lr0*step**(-decay_rate)
 
     for param_group in optimizer.param_groups: param_group['lr'] = lr
     return
