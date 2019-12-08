@@ -25,7 +25,7 @@ def train1():
     args['rnn_hidden_size'] = 300 # RNN hidden size
 
     args['update_nbatches'] = 2
-    args['learning_rate']   = 5e-3
+    args['learning_rate']   = 0.1
     args['random_seed']     = 28
     # ---------------------------------------------------------------------------------- #
 
@@ -38,7 +38,7 @@ def train1():
         else:
             # pdb.set_trace()
             print('running locally...')
-            os.environ["CUDA_VISIBLE_DEVICES"] = '3' # choose the device (GPU) here
+            os.environ["CUDA_VISIBLE_DEVICES"] = '1' # choose the device (GPU) here
         device = 'cuda'
     else:
         device = 'cpu'
@@ -57,7 +57,7 @@ def train1():
 
     # Hyperparameters
     BATCH_SIZE = 2
-    NUM_EPOCHS = 50
+    NUM_EPOCHS = 1000
 
     criterion = nn.NLLLoss(reduction='none')
 
@@ -89,10 +89,12 @@ def train1():
             loss = criterion(decoder_output.view(-1, args['vocab_size']), decoder_target)
             loss = (loss * decoder_mask).sum() / decoder_mask.sum()
             loss.backward()
+
             idx += BATCH_SIZE
 
             if bn % args['update_nbatches'] == 0:
                 # update the gradients
+                adjust_lr(optimizer, epoch, num_batches, bn)
                 optimizer.step()
                 optimizer.zero_grad()
 
@@ -101,12 +103,22 @@ def train1():
                 sys.stdout.flush()
 
             if bn % 5 == 0:
+                print("Learning Rate = {}".format(optimizer.param_groups[0]['lr']))
                 print("======================== GENERATED SUMMARY ========================")
                 print(bert_tokenizer.decode(torch.argmax(decoder_output[0], dim=-1).cpu().numpy()[:tgt_len[0]]))
                 print("======================== REFERENCE SUMMARY ========================")
                 print(bert_tokenizer.decode(decoder_target.view(BATCH_SIZE,args['summary_length'])[0,:tgt_len[0]].cpu().numpy()))
 
     print("End of training hierarchical RNN model")
+
+def adjust_lr(optimizer, epoch, epoch_size, bn):
+    """to adjust the learning rate for both encoder & decoder"""
+    step = (epoch * epoch_size) + bn + 1 # plus 1 to avoid ZeroDivisionError
+    # lr = min(1e-3, 0.05*step**(-1.25))
+    lr = 0.8*step**(-0.5)
+
+    for param_group in optimizer.param_groups: param_group['lr'] = lr
+    return
 
 def shift_decoder_target(target, tgt_len, device):
     # MASK_TOKEN_ID = 103
