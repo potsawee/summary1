@@ -19,7 +19,8 @@ def train1():
     args['use_gpu']        = True
     args['num_utterances'] = 2000  # max no. utterance in a meeting
     args['num_words']      = 64    # max no. words in an utterance
-    args['summary_length'] = 800   # max no. words in a summary
+    args['summary_length'] = 300   # max no. words in a summary
+    args['summary_type']   = 'short'   # max no. words in a summary
     args['vocab_size']     = 30522 # BERT tokenizer
     args['embedding_dim']  = 256   # word embeeding dimension
     args['rnn_hidden_size'] = 300 # RNN hidden size
@@ -34,15 +35,15 @@ def train1():
     args['random_seed']     = 28
     args['best_val_loss']     = 1e+10
     args['val_batch_size']    = 4
-    args['val_stop_training'] = 10
+    args['val_stop_training'] = 5
 
     args['lr']         = 0.1
     args['adjust_lr']  = True # if True overwrite the learning rate above
-    args['initial_lr'] = 1.0  # lr = lr_0*step^(-decay_rate)
+    args['initial_lr'] = 0.1  # lr = lr_0*step^(-decay_rate)
     args['decay_rate'] = 0.5
 
     args['model_save_dir'] = "/home/alta/summary/pm574/summariser1/lib/trained_models/"
-    args['model_name'] = 'HGRU_DEC8D'
+    args['model_name'] = 'HGRU_DEC9A'
     # ---------------------------------------------------------------------------------- #
     print_config(args)
 
@@ -107,7 +108,7 @@ def train1():
             input, u_len, w_len, target, tgt_len = get_a_batch(
                     train_data, idx, BATCH_SIZE,
                     args['num_utterances'], args['num_words'],
-                    args['summary_length'], device)
+                    args['summary_length'], args['summary_type'], device)
 
             # decoder target
             decoder_target, decoder_mask = shift_decoder_target(target, tgt_len, device)
@@ -136,7 +137,7 @@ def train1():
                 print("[{}] batch number {}/{}: loss = {}".format(str(datetime.now()), bn, num_batches, loss))
                 sys.stdout.flush()
 
-            if bn % 10 == 0:
+            if bn % 20 == 0:
 
                 print("======================== GENERATED SUMMARY ========================")
                 print(bert_tokenizer.decode(torch.argmax(decoder_output[0], dim=-1).cpu().numpy()[:tgt_len[0]]))
@@ -193,7 +194,7 @@ def evaluate(model, eval_data, eval_batch_size, args, device):
         input, u_len, w_len, target, tgt_len = get_a_batch(
                 eval_data, eval_idx, eval_batch_size,
                 args['num_utterances'], args['num_words'],
-                args['summary_length'], device)
+                args['summary_length'], args['summary_type'], device)
 
         # decoder target
         decoder_target, decoder_mask = shift_decoder_target(target, tgt_len, device)
@@ -243,7 +244,10 @@ def shift_decoder_target(target, tgt_len, device):
 
     return decoder_target, decoder_mask
 
-def get_a_batch(ami_data, idx, batch_size, num_utterances, num_words, summary_length, device):
+def get_a_batch(ami_data, idx, batch_size, num_utterances, num_words, summary_length, sum_type, device):
+    if sum_type not in ['long', 'short']:
+        raise Exception("summary type long/short only")
+
     input   = torch.zeros((batch_size, num_utterances, num_words), dtype=torch.long)
     summary = torch.zeros((batch_size, summary_length), dtype=torch.long)
 
@@ -258,7 +262,10 @@ def get_a_batch(ami_data, idx, batch_size, num_utterances, num_words, summary_le
 
     for bn in range(batch_size):
         topic_segments  = ami_data[idx+bn][0]
-        encoded_summary = ami_data[idx+bn][1]
+        if sum_type == 'long':
+            encoded_summary = ami_data[idx+bn][1]
+        elif sum_type == 'short':
+            encoded_summary = ami_data[idx+bn][2]
         # input
         utt_id = 0
         for segment in topic_segments:
@@ -293,7 +300,7 @@ def get_a_batch(ami_data, idx, batch_size, num_utterances, num_words, summary_le
     return input, utt_lengths, word_lengths, summary, summary_lengths
 
 def load_ami_data(data_type):
-    path = "lib/model_data/ami-191206.{}.pk.bin".format(data_type)
+    path = "lib/model_data/ami-191209.{}.pk.bin".format(data_type)
     with open(path, 'rb') as f:
         ami_data = pickle.load(f, encoding="bytes")
     return ami_data

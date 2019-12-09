@@ -114,9 +114,11 @@ def get_ami_data(dir, data_type, style):
 
             inputtsvpath = "{}/{}{}.{}.tsv".format(dir,scenario,part,style)
             longsummpath = "{}/{}{}.abslong.txt".format(dir,scenario,part)
+            shortsummpath = "{}/{}{}.absshort.txt".format(dir,scenario,part)
             topic_segments  = process_input(inputtsvpath)
-            encoded_summary = process_summary(longsummpath)
-            ami_data.append((topic_segments, encoded_summary))
+            encoded_summary_long  = process_summary(longsummpath)
+            encoded_summary_short = process_summary(shortsummpath)
+            ami_data.append((topic_segments, encoded_summary_long, encoded_summary_short))
             print("loaded: {}{}".format(scenario,part))
 
     return ami_data
@@ -127,8 +129,8 @@ if __name__ == "__main__":
     valid_data = get_ami_data(ami_dir, data_type='valid', style='manual') # len = 20
     test_data  = get_ami_data(ami_dir, data_type='test',  style='manual') # len = 20
 
-    with open("lib/model_data/ami-191206.train.pk.bin", "wb") as f: pickle.dump(train_data, f)
-    with open("lib/model_data/ami-191206.valid.pk.bin", "wb") as f: pickle.dump(valid_data, f)
-    with open("lib/model_data/ami-191206.test.pk.bin", "wb") as f: pickle.dump(test_data, f)
+    with open("lib/model_data/ami-191209.train.pk.bin", "wb") as f: pickle.dump(train_data, f)
+    with open("lib/model_data/ami-191209.valid.pk.bin", "wb") as f: pickle.dump(valid_data, f)
+    with open("lib/model_data/ami-191209.test.pk.bin", "wb") as f: pickle.dump(test_data, f)
 
     print("process data finished")
