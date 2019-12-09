@@ -7,12 +7,15 @@ class AdaptiveGRU(nn.Module):
     def __init__(self, input_size, hidden_size, num_layers, bias, batch_first=True, dropout=0.1):
         super(AdaptiveGRU, self).__init__()
         self.hidden_size = hidden_size
-        self.num_layers = num_layers
+        self.num_layers  = num_layers
         self.batch_first = batch_first
-        self.dropout = dropout
+        self.dropout     = dropout
 
         # parameters
-        self.grucell = nn.GRUCell(input_size, hidden_size, bias)
+        for n in range(num_layers):
+            setattr(self, 'grucell_{}'.format(n), nn.GRUCell(input_size, hidden_size, bias) )
+
+        self.dropout_layer = nn.Dropout(p=dropout)
         self.binary_gate = BinaryGate(input_size, hidden_size, hidden_size)
 
     def forward(self, input, h0, input_lengths):
@@ -23,23 +26,34 @@ class AdaptiveGRU(nn.Module):
         segment_indices = [[] for _ in range(batch_size)]
 
         for bn in range(batch_size):
-            ht = h0
+            ht = [h0 for _ in range(self.num_layers)]
             for t in range(input_lengths[bn]):
                 # GRU cell
                 xt = input[bn:bn+1, t]
-                ht = self.grucell(xt, ht)
-                output[bn, t] = ht[0]
+
+                for n in range(self.num_layers):
+                    grucell_n = getattr(self, 'grucell_{}'.format(n))
+                    ht[n] = grucell_n(xt, ht[n])
+
+                    # apply dropout --- apart from the output of the last layer
+                    if n < self.num_layers - 1:
+                        xt = self.dropout_layer(ht[n])
+                    else:
+                        xt = ht[n]
+
+                ht_n = xt
+                output[bn, t] = ht_n[0]
 
                 # binary gate
                 if t < input_lengths[bn]-1:
                     xt1 = input[bn:bn+1, t+1]
-                    gt = self.binary_gate(xt1, ht)
+                    gt = self.binary_gate(xt1, ht_n)
                 else:
                     gt = 1.0
 
                 if gt > 0.5: # segmetation & reset GRU cell
                     segment_indices[bn].append(t)
-                    ht = h0
+                    ht = [h0 for _ in range(self.num_layers)]
                 else: # no segmentation & pass GRU state
                     pass
 

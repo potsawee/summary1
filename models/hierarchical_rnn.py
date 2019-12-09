@@ -9,13 +9,20 @@ class EncoderDecoder(nn.Module):
         super(EncoderDecoder, self).__init__()
         self.device = device
 
+
         # Encoder - Hierarchical GRU
-        self.encoder = HierarchicalGRU(args['vocab_size'], args['embedding_dim'], args['rnn_hidden_size'])
+        self.encoder = HierarchicalGRU(args['vocab_size'], args['embedding_dim'], args['rnn_hidden_size'],
+                                       num_layers=args['num_layers_enc'], dropout=args['dropout'])
 
         # Decoder - GRU with attention mechanism
         self.decoder = DecoderGRU(args['vocab_size'], args['embedding_dim'], args['rnn_hidden_size'], args['rnn_hidden_size'],
-                                  num_layers=4, dropout=0.1)
+                                       num_layers=args['num_layers_dec'], dropout=args['dropout'])
 
+        self.param_init()
+
+        self.to(device)
+
+    def param_init(self):
         # Initialisation
         # zero out the bias term
         # don't zero out LayerNorm term e.g. transformer_encoder.layers.0.norm1.weight
@@ -23,15 +30,12 @@ class EncoderDecoder(nn.Module):
             if p.dim() > 1: nn.init.xavier_normal_(p)
             else:
                 # if name[-4:] == 'bias': p.data.zero_()
-                if name[-4:] == 'bias': nn.init.zeros_(p)
-
+                if 'bias' in name: nn.init.zeros_(p)
         for name, p in self.decoder.named_parameters():
             if p.dim() > 1: nn.init.xavier_normal_(p)
             else:
                 # if name[-4:] == 'bias': p.data.zero_()
-                if name[-4:] == 'bias': nn.init.zeros_(p)
-
-        self.to(device)
+                if 'bias' in name: nn.init.zeros_(p)
 
     def forward(self, input, u_len, w_len, target):
         s_output, s_len = self.encoder(input, u_len, w_len)
@@ -39,7 +43,7 @@ class EncoderDecoder(nn.Module):
         return dec_output
 
 class HierarchicalGRU(nn.Module):
-    def __init__(self, vocab_size, embedding_dim, rnn_hidden_size):
+    def __init__(self, vocab_size, embedding_dim, rnn_hidden_size, num_layers, dropout):
         super(HierarchicalGRU, self).__init__()
         self.vocab_size      = vocab_size
         self.embedding_dim   = embedding_dim
@@ -49,16 +53,16 @@ class HierarchicalGRU(nn.Module):
         self.embedding = nn.Embedding(self.vocab_size, embedding_dim=self.embedding_dim, padding_idx=0)
 
         # word-level GRU layer: word-embeddings -> utterance representation
-        self.gru_wlevel = nn.GRU(input_size=self.embedding_dim, hidden_size=self.rnn_hidden_size, num_layers=2,
-                                bias=True, batch_first=True, dropout=0.1, bidirectional=False)
+        self.gru_wlevel = nn.GRU(input_size=self.embedding_dim, hidden_size=self.rnn_hidden_size, num_layers=num_layers,
+                                bias=True, batch_first=True, dropout=dropout, bidirectional=False)
 
         # utterance-level GRU layer (with  binary gate)
         self.adapt_gru_ulevel = AdaptiveGRU(input_size=self.rnn_hidden_size, hidden_size=self.rnn_hidden_size,
-                                            num_layers=2, bias=True)
+                                            num_layers=num_layers, bias=True, batch_first=True, dropout=dropout)
 
         # segment-level GRU layer
-        self.gru_slevel = nn.GRU(input_size=self.rnn_hidden_size, hidden_size=self.rnn_hidden_size, num_layers=2,
-                                bias=True, batch_first=True, dropout=0.1, bidirectional=False)
+        self.gru_slevel = nn.GRU(input_size=self.rnn_hidden_size, hidden_size=self.rnn_hidden_size, num_layers=num_layers,
+                                bias=True, batch_first=True, dropout=dropout, bidirectional=False)
 
     def forward(self, input, u_len, w_len):
         # input => [batch_size, num_utterances, num_words]
@@ -101,7 +105,7 @@ class HierarchicalGRU(nn.Module):
 class DecoderGRU(nn.Module):
     """A conditional RNN decoder with attention."""
 
-    def __init__(self, vocab_size, embedding_dim, dec_hidden_size, mem_hidden_size, num_layers=4, dropout=0.1):
+    def __init__(self, vocab_size, embedding_dim, dec_hidden_size, mem_hidden_size, num_layers, dropout):
         super(DecoderGRU, self).__init__()
         self.vocab_size  = vocab_size
         self.dec_hidden_size = dec_hidden_size
@@ -113,8 +117,7 @@ class DecoderGRU(nn.Module):
 
         self.rnn = nn.GRU(embedding_dim, dec_hidden_size, num_layers, batch_first=True, dropout=dropout)
 
-        self.dropout_layer = nn.Dropout(p=dropout)
-
+        # self.dropout_layer = nn.Dropout(p=dropout)
         self.attention = nn.Linear(mem_hidden_size, dec_hidden_size)
         self.attn_softmax = nn.Softmax(dim=-1)
         self.output_layer = nn.Linear(embedding_dim+dec_hidden_size+mem_hidden_size, vocab_size, bias=True)

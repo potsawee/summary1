@@ -16,13 +16,17 @@ def train1():
     print("Start training hierarchical RNN model")
     # ---------------------------------------------------------------------------------- #
     args = {}
-    args['use_gpu'] = True
+    args['use_gpu']        = True
     args['num_utterances'] = 2000  # max no. utterance in a meeting
     args['num_words']      = 64    # max no. words in an utterance
     args['summary_length'] = 800   # max no. words in a summary
     args['vocab_size']     = 30522 # BERT tokenizer
     args['embedding_dim']  = 256   # word embeeding dimension
     args['rnn_hidden_size'] = 300 # RNN hidden size
+
+    args['dropout']        = 0.5
+    args['num_layers_enc'] = 4    # in total it's num_layers_enc*3 (word/utt/seg)
+    args['num_layers_dec'] = 8
 
     args['batch_size']      = 1
     args['update_nbatches'] = 2
@@ -32,14 +36,16 @@ def train1():
     args['val_batch_size']    = 4
     args['val_stop_training'] = 10
 
-    args['lr']        = 0.1
-    args['adjust_lr'] = True # if True overwrite the learning rate above
-    args['initial_lr'] = 0.1 # lr = lr_0*step^(-decay_rate)
+    args['lr']         = 0.1
+    args['adjust_lr']  = True # if True overwrite the learning rate above
+    args['initial_lr'] = 1.0  # lr = lr_0*step^(-decay_rate)
     args['decay_rate'] = 0.5
 
     args['model_save_dir'] = "/home/alta/summary/pm574/summariser1/lib/trained_models/"
-    args['model_name'] = 'HGRU_DEC8A'
+    args['model_name'] = 'HGRU_DEC8D'
     # ---------------------------------------------------------------------------------- #
+    print_config(args)
+
 
     if args['use_gpu']:
         if 'X_SGE_CUDA_DEVICE' in os.environ: # to run on CUED stack machine
@@ -166,6 +172,8 @@ def train1():
 
                     else:
                         print("Model has not improved for {} times! Stop training.".format(VAL_STOP_TRAINING))
+                        return
+
     print("End of training hierarchical RNN model")
 
 def evaluate(model, eval_data, eval_batch_size, args, device):
@@ -290,6 +298,11 @@ def load_ami_data(data_type):
         ami_data = pickle.load(f, encoding="bytes")
     return ami_data
 
+def print_config(args):
+    print("============================= CONFIGURATION =============================")
+    for x in args:
+        print('{}={}'.format(x, args[x]))
+    print("=========================================================================")
 
 if __name__ == "__main__":
     # ------ TRAINING ------ #
