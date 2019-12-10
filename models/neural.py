@@ -76,3 +76,26 @@ class BinaryGate(nn.Module):
         z = self.sigmoid(self.linearF(y))
 
         return z
+
+class LabelSmoothingLoss(nn.Module):
+    def __init__(self, num_classes, smoothing=0.0, dim=-1, reduction='mean'):
+        super(LabelSmoothingLoss, self).__init__()
+        self.confidence = 1.0 - smoothing
+        self.smoothing = smoothing
+        self.num_classes = num_classes
+        self.dim = dim
+        self.reduction = reduction
+
+    def forward(self, pred, target):
+        # pred --- logsoftmax already applied
+        with torch.no_grad():
+            true_dist = torch.zeros_like(pred)
+            true_dist.fill_(self.smoothing / (self.num_classes - 1))
+            true_dist.scatter_(1, target.data.unsqueeze(1), self.confidence)
+
+        if self.reduction == 'mean':
+            return torch.mean(torch.sum(-true_dist * pred, dim=self.dim))
+        elif self.reduction == 'none':
+            return torch.sum(-true_dist * pred, dim=self.dim)
+        else:
+            raise RuntimeError("reduction mode not supported")

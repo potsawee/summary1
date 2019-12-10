@@ -123,7 +123,38 @@ def get_ami_data(dir, data_type, style):
 
     return ami_data
 
-if __name__ == "__main__":
+def rouge_reference(dir_in, dir_out, style, sumtype):
+    idx = 0
+    for scenario in SCENARIO_TEST:
+        for part in ['a','b','c','d']:
+            if scenario == "IS1002" and part == "a": continue
+            if scenario == "IS1005" and part == "d": continue
+            if scenario == "ES2006" and part == "c": continue # no topic segmentation
+            if scenario == "ES2015" and part == "b": continue # no topic segmentation
+            if scenario == "ES2015" and part == "c": continue # no topic segmentation
+            if scenario == "TS3012" and part == "c": continue # no extractive summary
+
+            if sumtype == 'long':
+                summpath = "{}/{}{}.abslong.txt".format(dir_in,scenario,part)
+            elif sumtype == 'short':
+                summpath = "{}/{}{}.absshort.txt".format(dir_in,scenario,part)
+
+            with open(summpath, 'r') as f:
+                lines = f.readlines()
+
+            path_out = "{}/file.{}.txt".format(dir_out, idx)
+            with open(path_out, 'w') as f:
+                f.write("".join(lines))
+            idx += 1
+
+def rouge_reference_go():
+    dir_in = "/home/alta/summary/pm574/data/amicorpus/summary_work/v-191203"
+    dir_out = "/home/alta/summary/pm574/summariser1/out_summary/reference/short"
+    style = 'manual'
+    sumtype = 'short'
+    rouge_reference(dir_in, dir_out, style, sumtype)
+
+def main():
     ami_dir = "/home/alta/summary/pm574/data/amicorpus/summary_work/v-191203"
     train_data = get_ami_data(ami_dir, data_type='train', style='manual') # len = 94
     valid_data = get_ami_data(ami_dir, data_type='valid', style='manual') # len = 20
@@ -134,3 +165,7 @@ if __name__ == "__main__":
     with open("lib/model_data/ami-191209.test.pk.bin", "wb") as f: pickle.dump(test_data, f)
 
     print("process data finished")
+
+if __name__ == "__main__":
+    # main()
+    rouge_reference_go()
