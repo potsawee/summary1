@@ -45,7 +45,7 @@ class EncoderDecoder(nn.Module):
         dec_output = self.decoder(target, s_output, s_len)
         return dec_output
 
-    def decode_beamsearch(self, input, u_len, w_len, decode_dict, target):
+    def decode_beamsearch(self, input, u_len, w_len, decode_dict):
         """
         this method is meant to be used at inference time
             input = input to the encoder
@@ -71,7 +71,7 @@ class EncoderDecoder(nn.Module):
         start_token_id   = decode_dict['start_token_id']
         stop_token_id    = decode_dict['stop_token_id']
         alpha            = decode_dict['alpha']
-        length_offset    = decode_dict['length_offset']
+        # length_offset    = decode_dict['length_offset']
         keypadmask_dtype = decode_dict['keypadmask_dtype']
 
         # create beam array & scores
@@ -87,16 +87,15 @@ class EncoderDecoder(nn.Module):
 
         for i in range(k): beams[i] = tgt_ids
 
+        finished_beams = [[] for _ in range(batch_size)]
+
         for t in range(time_step-1):
             decoder_output_t_array = torch.zeros((batch_size, k*vocab_size))
 
             for i, beam in enumerate(beams):
 
                 # inference decoding
-                # decoder_output = self.decoder(beam[:,:t+1], s_output, s_len, logsoftmax=False)[:,-1,:]
-                # traching forcing
-                decoder_output = self.decoder(target[:,:t+1], s_output, s_len, logsoftmax=False)[:,-1,:]
-
+                decoder_output = self.decoder(beam[:,:t+1], s_output, s_len, logsoftmax=True)[:,-1,:]
 
                 # check if there is STOP_TOKEN emitted in the previous time step already
                 # i.e. if the input at this time step is STOP_TOKEN
@@ -105,20 +104,26 @@ class EncoderDecoder(nn.Module):
                         decoder_output[n_idx, :] = float('-inf')
                         decoder_output[n_idx, stop_token_id] = 0.0 # to ensure STOP_TOKEN will be picked again!
 
-                    else: # need to update scores --- length norm
-                        beam_scores[n_idx,i] *= (t-1+length_offset)**alpha
-                        beam_scores[n_idx,i] /= (t+length_offset)**alpha
-
-                # length_norm = 1/(length)^alpha ... alpha = 0.7
-                decoder_output_t_array[:,i*vocab_size:(i+1)*vocab_size] = decoder_output/(t+length_offset)**alpha
+                decoder_output_t_array[:,i*vocab_size:(i+1)*vocab_size] = decoder_output
 
                 # add previous beam score bias
                 for n_idx in range(batch_size):
                     decoder_output_t_array[n_idx,i*vocab_size:(i+1)*vocab_size] += beam_scores[n_idx,i]
 
-                if t == 0: break # only fill once for the first time step
 
-            scores, indices = torch.topk(decoder_output_t_array, k=k, dim=-1)
+            # scores, indices = torch.topk(decoder_output_t_array, k=k, dim=-1)
+            scores  = np.zeros((batch_size, k))
+            indices = np.zeros((batch_size, k))
+            # pmf = nn.functional.softmax(decoder_output_t_array, dim=-1).cpu().numpy()
+            pmf = np.exp(decoder_output_t_array.cpu().numpy())
+            for bi in range(batch_size):
+                if pmf[bi].sum() != 1.0:
+                    pmf[bi] /= pmf[bi].sum()
+                sampled_ids = np.random.choice(k*vocab_size, size=k, p=pmf[bi])
+                for _s, s_id in enumerate(sampled_ids):
+                    scores[bi, _s]  = decoder_output_t_array[bi, s_id]
+                    indices[bi, _s] = s_id
+
             new_beams = [torch.zeros((batch_size, time_step), dtype=torch.int64).to(device) for _ in range(k)]
             for r_idx, row in enumerate(indices):
                 for c_idx, node in enumerate(row):
@@ -128,23 +133,111 @@ class EncoderDecoder(nn.Module):
                     new_beams[c_idx][r_idx,:t+1] = beams[beam_idx][r_idx,:t+1]
                     new_beams[c_idx][r_idx,t+1]  = vocab_idx
 
-            beam_scores = scores.cpu().numpy()
+                    # if there is a beam that has [END_TOKEN] --- store it
+                    if vocab_idx == stop_token_id:
+                        finished_beams[r_idx].append(new_beams[c_idx][r_idx,:t+1+1])
+                        scores[r_idx, c_idx] = float('-inf')
+
+            # normalisation the score
+            scores = np.exp(scores)
+            scores = scores / scores.sum(axis=-1)
+            beam_scores = np.log(scores + 1e-20) # suppress warning log(zero)
             beams = new_beams
 
-            print(scores)
-            print(bert_tokenizer.decode(beams[0][0].cpu().numpy()[:t+1]))
-            pdb.set_trace()
+            # print("=========================  t = {} =========================".format(t))
+            # print("beam1: [{:.5f}]".format(scores[0,0]),bert_tokenizer.decode(beams[0][0].cpu().numpy()[:t+1]))
+            # print("beam2: [{:.5f}]".format(scores[0,1]),bert_tokenizer.decode(beams[1][0].cpu().numpy()[:t+1]))
+            # print("beam3: [{:.5f}]".format(scores[0,2]),bert_tokenizer.decode(beams[2][0].cpu().numpy()[:t+1]))
+            # print("beam4: [{:.5f}]".format(scores[0,3]),bert_tokenizer.decode(beams[3][0].cpu().numpy()[:t+1]))
+            # print("beam5: [{:.5f}]".format(scores[0,4]),bert_tokenizer.decode(beams[4][0].cpu().numpy()[:t+1]))
+            # pdb.set_trace()
 
-        #     if (t % 100) == 0:
-        #         print("{}=".format(t), end="")
-        #         sys.stdout.flush()
-        #
-        # print("{}=#".format(t))
+            if (t % 50) == 0:
+                print("{}=".format(t), end="")
+                sys.stdout.flush()
+        print("{}=#".format(t))
 
         summaries_id = [None for _ in range(batch_size)]
-        for j in range(batch_size): summaries_id[j] = beams[0][j].cpu().numpy()
+        # for j in range(batch_size): summaries_id[j] = beams[0][j].cpu().numpy()
+        for j in range(batch_size):
+            _scores = self.beam_scoring(finished_beams[j], s_output, s_len, alpha)
+            summaries_id[j] = finished_beams[j][np.argmax(_scores)].cpu().numpy()
+            print(bert_tokenizer.decode(summaries_id[j]))
 
         return summaries_id
+
+    def beam_scoring(self, beams, s_output, s_len, alpha):
+        # scores ===> same shape as the beams
+        # beams  ===> batch_size = 1
+        scores = [None for _ in range(len(beams))]
+        for i, seq in enumerate(beams):
+            timesteps = seq.size(0)
+            decoder_output = self.decoder(seq.view(1, timesteps), s_output, s_len, logsoftmax=True)
+
+            score = 0
+            for t in range(timesteps-1):
+                pred_t  = seq[t+1]
+                score_t = decoder_output[0, t, pred_t]
+                score  += score_t
+
+            scores[i] = score.cpu().numpy().item() / (timesteps)**alpha
+        return scores
+
+    def decode_sampling(self, input, u_len, w_len, decode_dict):
+        """
+        this method is meant to be used at inference time
+            input = input to the encoder
+            u_len = utterance lengths
+            w_len = word lengths
+            decode_dict:
+                - batch_size       = batch_size
+                - time_step        = max_summary_length
+                - vocab_size       = 30522 for BERT
+                - device           = cpu or cuda
+                - start_token_id   = ID of the start token
+                - stop_token_id    = ID of the stop token
+                - alpha            = length normalisation
+                - length_offset    = length offset
+                - keypadmask_dtype = torch.bool
+        """
+        batch_size       = decode_dict['batch_size']
+        time_step        = decode_dict['time_step']
+        vocab_size       = decode_dict['vocab_size']
+        device           = decode_dict['device']
+        start_token_id   = decode_dict['start_token_id']
+        stop_token_id    = decode_dict['stop_token_id']
+        alpha            = decode_dict['alpha']
+        length_offset    = decode_dict['length_offset']
+        keypadmask_dtype = decode_dict['keypadmask_dtype']
+
+        # we should only feed through the encoder just once!!
+        s_output, s_len = self.encoder(input, u_len, w_len) # memory
+
+        # we run the decoder time_step times (auto-regressive)
+        tgt_ids = torch.zeros((batch_size, time_step), dtype=torch.int64).to(device)
+        tgt_ids[:,0] = start_token_id
+
+        for t in range(time_step-1):
+
+            decoder_output = self.decoder(tgt_ids[:,:t+1], s_output, s_len, logsoftmax=False)[:,-1,:]
+            pmf = nn.functional.softmax(decoder_output, dim=-1).cpu().numpy()
+            for bn in range(batch_size):
+                id  = np.random.choice(vocab_size, p=pmf[bn])
+                tgt_ids[bn,t+1] = id
+
+
+            if (t % 100) == 0:
+                print("{}=".format(t), end="")
+                sys.stdout.flush()
+
+        print("{}=#".format(t))
+        # print(bert_tokenizer.decode(tgt_ids[0].cpu().numpy()))
+
+        summaries_id = [None for _ in range(batch_size)]
+        for j in range(batch_size): summaries_id[j] = tgt_ids[j].cpu().numpy()
+
+        return summaries_id
+
 
 
 class HierarchicalGRU(nn.Module):
@@ -236,7 +329,6 @@ class DecoderGRU(nn.Module):
 
     def forward(self, target, enc_output, enc_output_len, logsoftmax=True):
         embed = self.embedding(target)
-
         # rnn_output, _ = self.rnn(embed)
         for n in range(self.num_layers):
             rnn_layer_n = getattr(self, 'rnn_layer_{}'.format(n))
@@ -262,3 +354,17 @@ class DecoderGRU(nn.Module):
             dec_output = self.logsoftmax(dec_output)
 
         return dec_output
+
+    # def forward_step(self, xt, ht, enc_output, enc_output_len):
+    #     xt = self.embedding(xt) # xt => [batch_size, 1, input_size]
+    #                             # ht => [batch_size, num_layers, hidden_size]
+    #     ht1 = torch.zeros((xt.size(0)))
+    #     for n in range(self.num_layers):
+    #         rnn_layer_n = getattr(self, 'rnn_layer_{}'.format(n))
+    #         _h = ht[:,n,:]
+    #         if n == 0:
+    #             _x = embed
+    #             _, ht1 = rnn_layer_n(_x, _h)
+    #         else:
+    #             _x = self.dropout_layer(rnn_output) + _x # residual connection
+    #             rnn_output, _ = rnn_layer_n(_x)
