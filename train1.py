@@ -18,44 +18,44 @@ def train1():
     # ---------------------------------------------------------------------------------- #
     args = {}
     args['use_gpu']        = True
-    args['multiple_gpu']   = True  # to enable running on multiple GPUs on stack
+    args['air_multi_gpu']  = True  # to enable running on multiple GPUs on stack
     args['num_utterances'] = 2000  # max no. utterance in a meeting
     args['num_words']      = 64    # max no. words in an utterance
     args['summary_length'] = 800   # max no. words in a summary
     args['summary_type']   = 'long'   # long or short summary
     args['vocab_size']     = 30522 # BERT tokenizer
-    args['embedding_dim']   = 512   # word embeeding dimension
-    args['rnn_hidden_size'] = 512 # RNN hidden size
+    args['embedding_dim']   = 256   # word embeeding dimension
+    args['rnn_hidden_size'] = 256 # RNN hidden size
 
     args['dropout']        = 0.1
     args['num_layers_enc'] = 2    # in total it's num_layers_enc*3 (word/utt/seg)
     args['num_layers_dec'] = 6
 
     args['batch_size']      = 4
-    args['update_nbatches'] = 1   # 0 meaning whole batch update & using SGD
-    args['num_epochs']      = 1
+    args['update_nbatches'] = 2   # 0 meaning whole batch update & using SGD
+    args['num_epochs']      = 1000
     args['random_seed']     = 28
     args['best_val_loss']     = 1e+10
     args['val_batch_size']    = 4
     args['val_stop_training'] = 10
 
     args['lr']         = 0.1
-    args['adjust_lr']  = True # if True overwrite the learning rate above
-    args['initial_lr'] = 0.02      # lr = lr_0*step^(-decay_rate)
+    args['adjust_lr']  = True       # if True overwrite the learning rate above
+    args['initial_lr'] = 5e-4       # lr = lr_0*step^(-decay_rate)
     args['decay_rate'] = 0.5
     args['label_smoothing'] = 0.1
 
     args['model_save_dir'] = "/home/alta/summary/pm574/summariser1/lib/trained_models/"
-    # args['load_model'] = "/home/alta/summary/pm574/summariser1/lib/trained_models/model-HGRU_DEC9D-ep31.pt"
-    args['load_model'] = None
-    args['model_name'] = 'HGRUL_DEC11Xtest'
+    args['load_model'] = "/home/alta/summary/pm574/summariser1/lib/trained_models/model-HGRUL_DEC10B-ep20.pt"
+    # args['load_model'] = None
+    args['model_name'] = 'HGRUL_DEC10B3'
     # ---------------------------------------------------------------------------------- #
     print_config(args)
 
 
     if args['use_gpu']:
         if 'X_SGE_CUDA_DEVICE' in os.environ: # to run on CUED stack machine
-            if not args['multiple_gpu']:
+            if not args['air_multi_gpu']:
                 print('running on the stack... 1 GPU')
                 cuda_device = os.environ['X_SGE_CUDA_DEVICE']
                 print('X_SGE_CUDA_DEVICE is set to {}'.format(cuda_device))
@@ -84,10 +84,6 @@ def train1():
 
     model = EncoderDecoder(args, device=device)
     print(model)
-    if torch.cuda.device_count() > 1:
-        print("Multiple GPUs: {}".format(torch.cuda.device_count()))
-        model = nn.DataParallel(model)
-
 
     # Load model if specified (path to pytorch .pt)
     if args['load_model'] != None:
@@ -96,6 +92,11 @@ def train1():
         print("Loaded model from {}".format(args['load_model']))
     else:
         print("Train a new model")
+
+    # to use multiple GPUs
+    if torch.cuda.device_count() > 1:
+        print("Multiple GPUs: {}".format(torch.cuda.device_count()))
+        model = nn.DataParallel(model)
 
     # Hyperparameters
     BATCH_SIZE = args['batch_size']
@@ -215,7 +216,7 @@ def train1():
                         print("Model has not improved for {} times! Stop training.".format(VAL_STOP_TRAINING))
                         return
 
-    if args['multiple_gpu']: rm_multi_sl(args['model_name'])
+    if args['air_multi_gpu']: rm_multi_sl(args['model_name'])
     print("End of training hierarchical RNN model")
 
 def evaluate(model, eval_data, eval_batch_size, args, device):
