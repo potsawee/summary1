@@ -27,7 +27,7 @@ STOP_TOKEN_ID  = bert_tokenizer.convert_tokens_to_ids(STOP_TOKEN)
 TEST_DATA_SIZE = 20
 VOCAB_SIZE     = 30522
 
-def decoding(model, data, args, start_idx, batch_size, num_batches, k, alpha):
+def decoding(model, data, args, start_idx, batch_size, num_batches, k, search_method, alpha):
     device = args['device']
     max_summary_length = args['summary_length']
     time_step = max_summary_length
@@ -38,7 +38,8 @@ def decoding(model, data, args, start_idx, batch_size, num_batches, k, alpha):
     length_offset = 5
 
     decode_dict = {
-        'k': k, 'time_step': time_step, 'vocab_size': VOCAB_SIZE,
+        'k': k, 'search_method': search_method,
+        'time_step': time_step, 'vocab_size': VOCAB_SIZE,
         'device': device, 'start_token_id': START_TOKEN_ID,
         'stop_token_id': STOP_TOKEN_ID,
         'alpha': alpha, 'length_offset': length_offset,
@@ -96,8 +97,8 @@ def decode(start_idx):
     args['use_gpu']        = True
     args['num_utterances'] = 2000  # max no. utterance in a meeting
     args['num_words']      = 64    # max no. words in an utterance
-    args['summary_length'] = 300   # max no. words in a summary
-    args['summary_type']   = 'short'   # max no. words in a summary
+    args['summary_length'] = 800   # max no. words in a summary
+    args['summary_type']   = 'long'   # max no. words in a summary
     args['vocab_size']     = 30522 # BERT tokenizer
     args['embedding_dim']   = 256   # word embeeding dimension
     args['rnn_hidden_size'] = 256 # RNN hidden size
@@ -109,16 +110,17 @@ def decode(start_idx):
     args['model_save_dir'] = "/home/alta/summary/pm574/summariser1/lib/trained_models/"
     args['model_data_dir'] = "/home/alta/summary/pm574/summariser1/lib/model_data/"
 
-    args['model_name'] = "HGRU_DEC9G"
-    args['model_epoch'] = 9
+    args['model_name'] = "HGRUL_DEC10B"
+    args['model_epoch'] = 20
     # ---------------------------------------------------------------------------------- #
     start_idx   = start_idx
     batch_size  = 1
-    num_batches = 20
+    num_batches = 10
     args['decode_method'] = 'beamsearch'
+    search_method = 'argmax'
     beam_width  = 3
-    alpha       = 1.25
-    random_seed = 30
+    alpha       = 1.24
+    random_seed = 28
     # ---------------------------------------------------------------------------------- #
     if args['decode_method'] == 'sampling':
         args['summary_out_dir'] = \
@@ -127,8 +129,8 @@ def decode(start_idx):
 
     elif args['decode_method'] == 'beamsearch':
         args['summary_out_dir'] = \
-        '/home/alta/summary/pm574/summariser1/out_summary/model-{}-ep{}-width{}-alpha{}/' \
-            .format(args['model_name'], args['model_epoch'], beam_width, alpha)
+        '/home/alta/summary/pm574/summariser1/out_summary/model-{}-ep{}-width{}{}-alpha{}/' \
+            .format(args['model_name'], args['model_epoch'], beam_width, search_method, alpha)
     # ---------------------------------------------------------------------------------- #
 
     if args['use_gpu']:
@@ -140,7 +142,7 @@ def decode(start_idx):
         else:
             # pdb.set_trace()
             print('running locally...')
-            os.environ["CUDA_VISIBLE_DEVICES"] = '1' # choose the device (GPU) here
+            os.environ["CUDA_VISIBLE_DEVICES"] = '0' # choose the device (GPU) here
         device = 'cuda'
     else:
         device = 'cpu'
@@ -171,7 +173,8 @@ def decode(start_idx):
 
     with torch.no_grad():
         print("beam_width = {}".format(beam_width))
-        decoding(model, test_data, args, start_idx, batch_size, num_batches, k=beam_width, alpha=alpha)
+        decoding(model, test_data, args, start_idx, batch_size, num_batches,
+                 k=beam_width, search_method=search_method, alpha=alpha)
 
     print("finish decoding: idx [{},{})".format(start_idx, start_idx + batch_size*num_batches))
 
