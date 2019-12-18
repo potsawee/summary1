@@ -72,6 +72,7 @@ class EncoderDecoder(nn.Module):
         start_token_id   = decode_dict['start_token_id']
         stop_token_id    = decode_dict['stop_token_id']
         alpha            = decode_dict['alpha']
+        penalty_ug       = decode_dict['penalty_ug']
         # length_offset    = decode_dict['length_offset']
         keypadmask_dtype = decode_dict['keypadmask_dtype']
 
@@ -114,6 +115,16 @@ class EncoderDecoder(nn.Module):
                 # add previous beam score bias
                 for n_idx in range(batch_size):
                     decoder_output_t_array[n_idx,i*vocab_size:(i+1)*vocab_size] += beam_scores[n_idx,i]
+
+                    if search_method == 'argmax':
+                        # Penalty term for repeated uni-gram
+                        unigram_dict = {}
+                        for tt in range(t+1):
+                            v = beam[n_idx,tt].cpu().numpy().item()
+                            if v not in unigram_dict: unigram_dict[v] = 1
+                            else: unigram_dict[v] += 1
+                        for vocab_id, vocab_count in unigram_dict.items():
+                            decoder_output_t_array[n_idx,(i*vocab_size)+vocab_id] -= penalty_ug*vocab_count/(t+1)
 
                 # only support batch_size = 1!
                 if t == 0:
@@ -167,8 +178,6 @@ class EncoderDecoder(nn.Module):
                 beam_scores = np.log(scores + 1e-20) # suppress warning log(zero)
             elif search_method == 'argmax':
                 beam_scores = scores
-
-
 
             # print("=========================  t = {} =========================".format(t))
             # for ik in range(k):
