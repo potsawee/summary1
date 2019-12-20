@@ -4,8 +4,9 @@ import numpy as np
 import pdb
 
 class AdaptiveGRU(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, bias, batch_first=True, dropout=0.1):
+    def __init__(self, input_size, hidden_size, num_layers, bias, batch_first=True, dropout=0.1, device=None):
         super(AdaptiveGRU, self).__init__()
+        self.device      = device
         self.hidden_size = hidden_size
         self.num_layers  = num_layers
         self.batch_first = batch_first
@@ -22,7 +23,8 @@ class AdaptiveGRU(nn.Module):
         batch_size = input.size(0)
         num_utterances = input.size(1)
 
-        output = torch.zeros((batch_size, num_utterances, self.hidden_size)).cuda()
+        output = torch.zeros((batch_size, num_utterances, self.hidden_size)).to(self.device)
+        gate_z = torch.zeros((batch_size, num_utterances)).to(self.device)
         segment_indices = [[] for _ in range(batch_size)]
 
         for bn in range(batch_size):
@@ -51,13 +53,15 @@ class AdaptiveGRU(nn.Module):
                 else:
                     gt = 1.0
 
+                gate_z[bn, t] = gt
+
                 if gt > 0.5: # segmetation & reset GRU cell
                     segment_indices[bn].append(t)
                     ht = [h0 for _ in range(self.num_layers)]
                 else: # no segmentation & pass GRU state
                     pass
 
-        return output, segment_indices
+        return output, segment_indices, gate_z
 
 class BinaryGate(nn.Module):
     def __init__(self, dim1, dim2, hidden_size):

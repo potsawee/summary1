@@ -289,10 +289,10 @@ class HierarchicalGRU(nn.Module):
 
         # word-level GRU layer: word-embeddings -> utterance representation
         self.gru_wlevel = nn.GRU(input_size=self.embedding_dim, hidden_size=self.rnn_hidden_size, num_layers=num_layers,
-                                bias=True, batch_first=True, dropout=dropout, bidirectional=False)
+                                bias=True, batch_first=True, dropout=dropout, bidirectional=True)
 
         # utterance-level GRU layer (with  binary gate)
-        self.adapt_gru_ulevel = AdaptiveGRU(input_size=self.rnn_hidden_size, hidden_size=self.rnn_hidden_size,
+        self.adapt_gru_ulevel = AdaptiveGRU(input_size=2*self.rnn_hidden_size, hidden_size=self.rnn_hidden_size,
                                             num_layers=num_layers, bias=True, batch_first=True, dropout=dropout)
 
         # segment-level GRU layer
@@ -321,7 +321,7 @@ class HierarchicalGRU(nn.Module):
             utt_input[idx] = w_output[idx, l-1]
 
         # utterance-level GRU
-        utt_input = utt_input.view(batch_size, num_utterances, self.rnn_hidden_size)
+        utt_input = utt_input.view(batch_size, num_utterances, 2*self.rnn_hidden_size)
         h0 = torch.zeros((1, self.rnn_hidden_size), dtype=torch.float).cuda()
         utt_output, segment_indices = self.adapt_gru_ulevel(utt_input, h0, u_len)
 

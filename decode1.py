@@ -5,9 +5,10 @@ import torch
 import pdb
 import numpy as np
 import random
+from collections import OrderedDict
 from datetime import datetime
 
-from models.hierarchical_rnn import EncoderDecoder
+from models.hierarchical_rnn_v2 import EncoderDecoder
 from train1 import get_a_batch, load_ami_data
 from data_meeting import TopicSegment, Utterance, bert_tokenizer
 
@@ -27,7 +28,7 @@ STOP_TOKEN_ID  = bert_tokenizer.convert_tokens_to_ids(STOP_TOKEN)
 TEST_DATA_SIZE = 20
 VOCAB_SIZE     = 30522
 
-def decoding(model, data, args, start_idx, batch_size, num_batches, k, search_method, alpha):
+def decoding(model, data, args, start_idx, batch_size, num_batches, k, search_method, alpha, penalty_ug):
     device = args['device']
     max_summary_length = args['summary_length']
     time_step = max_summary_length
@@ -43,13 +44,14 @@ def decoding(model, data, args, start_idx, batch_size, num_batches, k, search_me
         'device': device, 'start_token_id': START_TOKEN_ID,
         'stop_token_id': STOP_TOKEN_ID,
         'alpha': alpha, 'length_offset': length_offset,
+        'penalty_ug': penalty_ug,
         'keypadmask_dtype': KEYPADMASK_DTYPE
     }
 
     for bn in range(num_batches):
         decode_dict['batch_size'] = batch_size
 
-        input, u_len, w_len, target, tgt_len  = get_a_batch(
+        input, u_len, w_len, target, tgt_len, _  = get_a_batch(
             data, start_idx+idx, batch_size, args['num_utterances'],
             args['num_words'], args['summary_length'], args['summary_type'], device)
 
@@ -94,43 +96,45 @@ def tgtids2summary(tgt_ids):
 def decode(start_idx):
     # ---------------------------------------------------------------------------------- #
     args = {}
-    args['use_gpu']        = True
+    args['use_gpu']        = False
     args['num_utterances'] = 2000  # max no. utterance in a meeting
     args['num_words']      = 64    # max no. words in an utterance
-    args['summary_length'] = 800   # max no. words in a summary
-    args['summary_type']   = 'long'   # max no. words in a summary
+    args['summary_length'] = 300   # max no. words in a summary
+    args['summary_type']   = 'short'   # max no. words in a summary
     args['vocab_size']     = 30522 # BERT tokenizer
     args['embedding_dim']   = 256   # word embeeding dimension
-    args['rnn_hidden_size'] = 256 # RNN hidden size
+    args['rnn_hidden_size'] = 512 # RNN hidden size
 
     args['dropout']        = 0.0
-    args['num_layers_enc'] = 2
-    args['num_layers_dec'] = 6
+    args['num_layers_enc'] = 1
+    args['num_layers_dec'] = 1
 
     args['model_save_dir'] = "/home/alta/summary/pm574/summariser1/lib/trained_models/"
     args['model_data_dir'] = "/home/alta/summary/pm574/summariser1/lib/model_data/"
 
-    args['model_name'] = "HGRUL_DEC10B"
-    args['model_epoch'] = 20
+    args['model_name'] = "HGRUV2_DEC19A"
+    args['model_epoch'] = 25
     # ---------------------------------------------------------------------------------- #
     start_idx   = start_idx
     batch_size  = 1
-    num_batches = 10
+    num_batches = 1
     args['decode_method'] = 'beamsearch'
     search_method = 'argmax'
-    beam_width  = 3
-    alpha       = 1.24
+    beam_width  = 10
+    alpha       = 1.5
+    penalty_ug  = 30.0
     random_seed = 28
     # ---------------------------------------------------------------------------------- #
     if args['decode_method'] == 'sampling':
         args['summary_out_dir'] = \
-        '/home/alta/summary/pm574/summariser1/out_summary/model-{}-ep{}-sampling/' \
+        '/home/alta/summary/pm574/summariser1/out_summary/model-{}-ep{}/sampling/' \
             .format(args['model_name'], args['model_epoch'])
 
     elif args['decode_method'] == 'beamsearch':
         args['summary_out_dir'] = \
-        '/home/alta/summary/pm574/summariser1/out_summary/model-{}-ep{}-width{}{}-alpha{}/' \
-            .format(args['model_name'], args['model_epoch'], beam_width, search_method, alpha)
+        '/home/alta/summary/pm574/summariser1/out_summary/model-{}-ep{}-len{}/width{}-{}-alpha{}-penalty{}/' \
+            .format(args['model_name'], args['model_epoch'], args['summary_length'],
+                    beam_width, search_method, alpha, penalty_ug)
     # ---------------------------------------------------------------------------------- #
 
     if args['use_gpu']:
@@ -156,11 +160,27 @@ def decode(start_idx):
 
     # Define and Load the model
     model = EncoderDecoder(args, device)
+
     trained_model = args['model_save_dir']+"model-{}-ep{}.pt".format(args['model_name'],args['model_epoch'])
     if device == 'cuda':
-        model.load_state_dict(torch.load(trained_model))
+        try:
+            model.load_state_dict(torch.load(trained_model))
+        except:
+            model_state_dict = torch.load(trained_model)
+            new_model_state_dict = OrderedDict()
+            for key in model_state_dict.keys():
+                new_model_state_dict[key.replace("module.","")] = model_state_dict[key]
+            model.load_state_dict(new_model_state_dict)
     elif device == 'cpu':
-        model.load_state_dict(torch.load(trained_model, map_location=torch.device('cpu')))
+        try:
+            model.load_state_dict(torch.load(trained_model, map_location=torch.device('cpu')))
+        except:
+            model_state_dict = torch.load(trained_model, map_location=torch.device('cpu'))
+            new_model_state_dict = OrderedDict()
+            for key in model_state_dict.keys():
+                new_model_state_dict[key.replace("module.","")] = model_state_dict[key]
+            model.load_state_dict(new_model_state_dict)
+        # model.load_state_dict(torch.load(trained_model, map_location=torch.device('cpu')))
 
     model.eval() # switch it to eval mode
     print("Restored model from {}".format(trained_model))
@@ -174,7 +194,7 @@ def decode(start_idx):
     with torch.no_grad():
         print("beam_width = {}".format(beam_width))
         decoding(model, test_data, args, start_idx, batch_size, num_batches,
-                 k=beam_width, search_method=search_method, alpha=alpha)
+                 k=beam_width, search_method=search_method, alpha=alpha, penalty_ug=penalty_ug)
 
     print("finish decoding: idx [{},{})".format(start_idx, start_idx + batch_size*num_batches))
 

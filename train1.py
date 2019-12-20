@@ -23,8 +23,8 @@ def train1():
     args['air_multi_gpu']  = False  # to enable running on multiple GPUs on stack
     args['num_utterances'] = 2000  # max no. utterance in a meeting
     args['num_words']      = 64    # max no. words in an utterance
-    args['summary_length'] = 800   # max no. words in a summary
-    args['summary_type']   = 'long'   # long or short summary
+    args['summary_length'] = 300   # max no. words in a summary
+    args['summary_type']   = 'short'   # long or short summary
     args['vocab_size']     = 30522 # BERT tokenizer
     args['embedding_dim']   = 256   # word embeeding dimension
     args['rnn_hidden_size'] = 512 # RNN hidden size
@@ -33,8 +33,8 @@ def train1():
     args['num_layers_enc'] = 1    # in total it's num_layers_enc*3 (word/utt/seg)
     args['num_layers_dec'] = 1
 
-    args['batch_size']      = 2
-    args['update_nbatches'] = 2   # 0 meaning whole batch update & using SGD
+    args['batch_size']      = 1
+    args['update_nbatches'] = 1   # 0 meaning whole batch update & using SGD
     args['num_epochs']      = 1000
     args['random_seed']     = 28
     args['best_val_loss']     = 1e+10
@@ -43,14 +43,14 @@ def train1():
 
     args['lr']         = 0.01
     args['adjust_lr']  = True       # if True overwrite the learning rate above
-    args['initial_lr'] = 5e-3       # lr = lr_0*step^(-decay_rate)
+    args['initial_lr'] = 1e-2       # lr = lr_0*step^(-decay_rate)
     args['decay_rate'] = 0.5
     args['label_smoothing'] = 0.1
 
     args['model_save_dir'] = "/home/alta/summary/pm574/summariser1/lib/trained_models/"
     # args['load_model'] = "/home/alta/summary/pm574/summariser1/lib/trained_models/model-HGRU_DEC17B-ep25.pt"
     args['load_model'] = None
-    args['model_name'] = 'HGRUV2_DEC19AM'
+    args['model_name'] = 'HGRUV2_DEC20X'
     # ---------------------------------------------------------------------------------- #
     print_config(args)
 
@@ -125,6 +125,8 @@ def train1():
     else:
         criterion = nn.NLLLoss(reduction='none')
 
+    topic_segment_criterion = nn.BCELoss(reduction='none')
+
     # we use two separate optimisers (encoder & decoder)
     optimizer = optim.Adam(model.parameters(),lr=args['lr'],betas=(0.9,0.999),eps=1e-08,weight_decay=0)
     optimizer.zero_grad()
@@ -152,7 +154,7 @@ def train1():
 
         for bn in range(num_batches):
 
-            input, u_len, w_len, target, tgt_len = get_a_batch(
+            input, u_len, w_len, target, tgt_len, topic_boundary_label = get_a_batch(
                     train_data, idx, BATCH_SIZE,
                     args['num_utterances'], args['num_words'],
                     args['summary_length'], args['summary_type'], device)
@@ -162,12 +164,18 @@ def train1():
             decoder_target = decoder_target.view(-1)
             decoder_mask = decoder_mask.view(-1)
 
-            decoder_output = model(input, u_len, w_len, target)
+            decoder_output, gate_z = model(input, u_len, w_len, target)
 
             loss = criterion(decoder_output.view(-1, args['vocab_size']), decoder_target)
             loss = (loss * decoder_mask).sum() / decoder_mask.sum()
-            with torch.autograd.set_detect_anomaly(True):
-                loss.backward()
+
+            # multitask(1): topic segmentation prediction
+            loss_ts = topic_segment_criterion(gate_z, topic_boundary_label)
+            loss_ts_mask = length2mask(u_len, BATCH_SIZE, args['num_utterances'], device)
+            loss_ts = (loss_ts * loss_ts_mask).sum() / loss_ts_mask.sum()
+
+            total_loss = loss + loss_ts
+            total_loss.backward()
 
             idx += BATCH_SIZE
 
@@ -190,7 +198,7 @@ def train1():
                     sgd_optimizer.zero_grad()
 
             if bn % 1 == 0:
-                print("[{}] batch number {}/{}: loss = {}".format(str(datetime.now()), bn, num_batches, loss))
+                print("[{}] batch {}/{}: loss = {:5f} | loss_ts = {:5f}".format(str(datetime.now()), bn, num_batches, loss, loss_ts))
                 sys.stdout.flush()
 
             if bn % 20 == 0:
@@ -234,6 +242,14 @@ def train1():
     if args['air_multi_gpu']: rm_multi_sl(args['model_name'])
     print("End of training hierarchical RNN model")
 
+def length2mask(length, batch_size, max_len, device):
+    mask = torch.zeros((batch_size, max_len), dtype=torch.float)
+    for bn in range(batch_size):
+        l = length[bn].item()
+        mask[bn,:l].fill_(1.0)
+    mask = mask.to(device)
+    return mask
+
 def evaluate(model, eval_data, eval_batch_size, args, device):
     # num_eval_epochs = int(eval_data['num_data']/eval_batch_size) + 1
     num_eval_epochs = int(len(eval_data)/eval_batch_size)
@@ -247,7 +263,7 @@ def evaluate(model, eval_data, eval_batch_size, args, device):
 
     for bn in range(num_eval_epochs):
 
-        input, u_len, w_len, target, tgt_len = get_a_batch(
+        input, u_len, w_len, target, tgt_len, _ = get_a_batch(
                 eval_data, eval_idx, eval_batch_size,
                 args['num_utterances'], args['num_words'],
                 args['summary_length'], args['summary_type'], device)
@@ -257,7 +273,7 @@ def evaluate(model, eval_data, eval_batch_size, args, device):
         decoder_target = decoder_target.view(-1)
         decoder_mask = decoder_mask.view(-1)
 
-        decoder_output = model(input, u_len, w_len, target)
+        decoder_output, _ = model(input, u_len, w_len, target)
 
         loss = criterion(decoder_output.view(-1, args['vocab_size']), decoder_target)
         eval_total_loss += (loss * decoder_mask).sum().item()
@@ -315,14 +331,14 @@ def get_a_batch(ami_data, idx, batch_size, num_utterances, num_words, summary_le
     summary = torch.zeros((batch_size, summary_length), dtype=torch.long)
     summary.fill_(103)
 
-    # utt_lengths  = torch.zeros((batch_size), dtype=torch.int)
-    # word_lengths = torch.zeros((batch_size, num_utterances), dtype=torch.int)
     utt_lengths  = np.zeros((batch_size), dtype=np.int)
     word_lengths = np.zeros((batch_size, num_utterances), dtype=np.int)
 
     # summary lengths
     summary_lengths = np.zeros((batch_size), dtype=np.int)
 
+    # topic boundaries
+    topic_boundary_label = torch.zeros((batch_size, num_utterances), dtype=torch.float)
 
     for bn in range(batch_size):
         topic_segments  = ami_data[idx+bn][0]
@@ -344,8 +360,10 @@ def get_a_batch(ami_data, idx, batch_size, num_utterances, num_words, summary_le
                 # word_lengths[bn,utt_id] = torch.tensor(l)
                 word_lengths[bn,utt_id] = l
                 utt_id += 1
-
                 if utt_id == num_utterances: break
+
+            topic_boundary_label[bn, utt_id-1] = 1
+
             if utt_id == num_utterances: break
 
         # utt_lengths[bn] = torch.tensor(utt_id)
@@ -361,18 +379,17 @@ def get_a_batch(ami_data, idx, batch_size, num_utterances, num_words, summary_le
 
     input   = input.to(device)
     summary = summary.to(device)
-    # utt_lengths  = utt_lengths.to(device)
-    # word_lengths = word_lengths.to(device)
+    topic_boundary_label = topic_boundary_label.to(device)
 
     # covert numpy to torch tensor (for multiple GPUs purpose)
     utt_lengths = torch.from_numpy(utt_lengths)
     word_lengths = torch.from_numpy(word_lengths)
     summary_lengths = torch.from_numpy(summary_lengths)
 
-    return input, utt_lengths, word_lengths, summary, summary_lengths
+    return input, utt_lengths, word_lengths, summary, summary_lengths, topic_boundary_label
 
 def load_ami_data(data_type):
-    path = "lib/model_data/ami-191209.{}.pk.bin".format(data_type)
+    path = "/home/alta/summary/pm574/summariser1/lib/model_data/ami-191209.{}.pk.bin".format(data_type)
     with open(path, 'rb') as f:
         ami_data = pickle.load(f, encoding="bytes")
     return ami_data
@@ -412,7 +429,7 @@ def load_cnndm_data(args, data_type, dump=False):
         for x, y in zip(articles, abstracts):
             cnndm_data.append((x,y,y))
     else:
-        path = "lib/model_data/cnndm-191216.{}.pk.bin".format(data_type)
+        path = "/home/alta/summary/pm574/summariser1/lib/model_data/cnndm-191216.{}.pk.bin".format(data_type)
         with open(path, 'rb') as f:
             cnndm_data = pickle.load(f, encoding="bytes")
 
