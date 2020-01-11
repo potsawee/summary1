@@ -21,6 +21,13 @@ CLS_TOKEN  = '[CLS]'
 SEP_TOKEN  = '[SEP]'
 MASK_TOKEN = '[MASK]'
 
+DA_MAPPING = {
+    'bck': 0, 'stl': 1, 'fra': 2,
+    'inf': 3, 'sug': 4, 'ass': 5,
+    'el.inf': 6, 'el.sug': 7, 'el.ass': 8, 'el.und': 9,
+    'off': 10, 'und': 11, 'be.pos': 12, 'be.neg': 13, 'oth': 14
+}
+
 class TopicSegment(object):
     def __init__(self):
         self.utterances = []

@@ -9,10 +9,10 @@ import pickle
 import random
 from datetime import datetime
 
-from data_meeting import TopicSegment, Utterance, bert_tokenizer
+from data_meeting import TopicSegment, Utterance, bert_tokenizer, DA_MAPPING
 from data import cnndm
 from data.cnndm import ProcessedDocument, ProcessedSummary
-from models.hierarchical_rnn_v2 import EncoderDecoder
+from models.hierarchical_rnn_v2 import EncoderDecoder, DALabeller, EXTLabeller
 from models.neural import LabelSmoothingLoss
 
 def train1():
@@ -23,8 +23,8 @@ def train1():
     args['air_multi_gpu']  = False  # to enable running on multiple GPUs on stack
     args['num_utterances'] = 2000  # max no. utterance in a meeting
     args['num_words']      = 64    # max no. words in an utterance
-    args['summary_length'] = 300   # max no. words in a summary
-    args['summary_type']   = 'short'   # long or short summary
+    args['summary_length'] = 800   # max no. words in a summary
+    args['summary_type']   = 'long'   # long or short summary
     args['vocab_size']     = 30522 # BERT tokenizer
     args['embedding_dim']   = 256   # word embeeding dimension
     args['rnn_hidden_size'] = 512 # RNN hidden size
@@ -33,12 +33,12 @@ def train1():
     args['num_layers_enc'] = 1    # in total it's num_layers_enc*3 (word/utt/seg)
     args['num_layers_dec'] = 1
 
-    args['batch_size']      = 1
-    args['update_nbatches'] = 1   # 0 meaning whole batch update & using SGD
+    args['batch_size']      = 2
+    args['update_nbatches'] = 2   # 0 meaning whole batch update & using SGD
     args['num_epochs']      = 1000
-    args['random_seed']     = 28
+    args['random_seed']     = 39
     args['best_val_loss']     = 1e+10
-    args['val_batch_size']    = 2
+    args['val_batch_size']    = 1
     args['val_stop_training'] = 10
 
     args['lr']         = 0.01
@@ -50,10 +50,9 @@ def train1():
     args['model_save_dir'] = "/home/alta/summary/pm574/summariser1/lib/trained_models/"
     # args['load_model'] = "/home/alta/summary/pm574/summariser1/lib/trained_models/model-HGRU_DEC17B-ep25.pt"
     args['load_model'] = None
-    args['model_name'] = 'HGRUV2_DEC20X'
+    args['model_name'] = 'HGRUV2_JAN11A_100'
     # ---------------------------------------------------------------------------------- #
     print_config(args)
-
 
     if args['use_gpu']:
         if 'X_SGE_CUDA_DEVICE' in os.environ: # to run on CUED stack machine
@@ -68,12 +67,11 @@ def train1():
                 write_multi_sl(args['model_name'])
         else:
             print('running locally...')
-            os.environ["CUDA_VISIBLE_DEVICES"] = '0,1' # choose the device (GPU) here
+            os.environ["CUDA_VISIBLE_DEVICES"] = '1,2' # choose the device (GPU) here
         device = 'cuda'
     else:
         device = 'cpu'
     print("device = {}".format(device))
-
 
     # random seed
     random.seed(args['random_seed'])
@@ -85,6 +83,10 @@ def train1():
     if dataset == 'ami':
         train_data = load_ami_data('train')
         valid_data = load_ami_data('valid')
+        # make the training data 100
+        random.shuffle(valid_data)
+        train_data.extend(valid_data[:6])
+        valid_data = valid_data[6:]
     elif dataset == 'cnndm':
         import pickle
         args['model_data_dir'] = "/home/alta/summary/pm574/summariser0/lib/model_data/"
@@ -97,6 +99,11 @@ def train1():
 
     model = EncoderDecoder(args, device=device)
     print(model)
+    NUM_DA_TYPES = len(DA_MAPPING)
+    da_labeller = DALabeller(args['rnn_hidden_size'], NUM_DA_TYPES, device)
+    print(da_labeller)
+    ext_labeller = EXTLabeller(args['rnn_hidden_size'], device)
+    print(ext_labeller)
 
     # to use multiple GPUs
     if torch.cuda.device_count() > 1:
@@ -111,8 +118,6 @@ def train1():
     else:
         print("Train a new model")
 
-
-
     # Hyperparameters
     BATCH_SIZE = args['batch_size']
     NUM_EPOCHS = args['num_epochs']
@@ -126,12 +131,22 @@ def train1():
         criterion = nn.NLLLoss(reduction='none')
 
     topic_segment_criterion = nn.BCELoss(reduction='none')
+    da_criterion = nn.NLLLoss(reduction='none')
+    ext_criterion = nn.BCELoss(reduction='none')
 
     # we use two separate optimisers (encoder & decoder)
     optimizer = optim.Adam(model.parameters(),lr=args['lr'],betas=(0.9,0.999),eps=1e-08,weight_decay=0)
     optimizer.zero_grad()
     sgd_optimizer = optim.SGD(model.parameters(), lr=args['lr'])
     sgd_optimizer.zero_grad()
+
+    # # DA labeller optimiser
+    # da_optimizer = optim.Adam(da_labeller.parameters(),lr=args['lr'],betas=(0.9,0.999),eps=1e-08,weight_decay=0)
+    # da_optimizer.zero_grad()
+    #
+    # # extractive labeller optimiser
+    # ext_optimizer = optim.Adam(ext_labeller.parameters(),lr=args['lr'],betas=(0.9,0.999),eps=1e-08,weight_decay=0)
+    # ext_optimizer.zero_grad()
 
     # validation losses
     best_val_loss = args['best_val_loss']
@@ -154,7 +169,7 @@ def train1():
 
         for bn in range(num_batches):
 
-            input, u_len, w_len, target, tgt_len, topic_boundary_label = get_a_batch(
+            input, u_len, w_len, target, tgt_len, topic_boundary_label, dialogue_acts, extractive_label = get_a_batch(
                     train_data, idx, BATCH_SIZE,
                     args['num_utterances'], args['num_words'],
                     args['summary_length'], args['summary_type'], device)
@@ -164,18 +179,29 @@ def train1():
             decoder_target = decoder_target.view(-1)
             decoder_mask = decoder_mask.view(-1)
 
-            decoder_output, gate_z = model(input, u_len, w_len, target)
+            decoder_output, gate_z, u_output = model(input, u_len, w_len, target)
 
             loss = criterion(decoder_output.view(-1, args['vocab_size']), decoder_target)
             loss = (loss * decoder_mask).sum() / decoder_mask.sum()
 
-            # multitask(1): topic segmentation prediction
-            loss_ts = topic_segment_criterion(gate_z, topic_boundary_label)
-            loss_ts_mask = length2mask(u_len, BATCH_SIZE, args['num_utterances'], device)
-            loss_ts = (loss_ts * loss_ts_mask).sum() / loss_ts_mask.sum()
-
-            total_loss = loss + loss_ts
-            total_loss.backward()
+            # # multitask(1): topic segmentation prediction
+            # loss_ts = topic_segment_criterion(gate_z, topic_boundary_label)
+            # loss_ts_mask = length2mask(u_len, BATCH_SIZE, args['num_utterances'], device)
+            # loss_ts = (loss_ts * loss_ts_mask).sum() / loss_ts_mask.sum()
+            #
+            # # multitask(2): dialogue act prediction
+            # da_output = da_labeller(u_output)
+            # loss_da = da_criterion(da_output.view(-1, NUM_DA_TYPES), dialogue_acts.view(-1)).view(BATCH_SIZE, -1)
+            # loss_da = (loss_da * loss_ts_mask).sum() / loss_ts_mask.sum()
+            #
+            # # multitask(3): extractive label prediction
+            # ext_output = ext_labeller(u_output).squeeze(-1)
+            # loss_ext = ext_criterion(ext_output, extractive_label)
+            # loss_ext = (loss_ext * loss_ts_mask).sum() / loss_ts_mask.sum()
+            #
+            # total_loss = loss + loss_ts + loss_da + loss_ext
+            # total_loss.backward()
+            loss.backward()
 
             idx += BATCH_SIZE
 
@@ -187,8 +213,14 @@ def train1():
                     # update the gradients
                     if args['adjust_lr']:
                         adjust_lr(optimizer, args['initial_lr'], args['decay_rate'], training_step)
+                        # adjust_lr(da_optimizer, args['initial_lr'], args['decay_rate'], training_step)
+                        # adjust_lr(ext_optimizer, args['initial_lr'], args['decay_rate'], training_step)
                     optimizer.step()
                     optimizer.zero_grad()
+                    # da_optimizer.step()
+                    # da_optimizer.zero_grad()
+                    # ext_optimizer.step()
+                    # ext_optimizer.zero_grad()
                     training_step += 1
             else:
                 # whole data set update
@@ -198,8 +230,12 @@ def train1():
                     sgd_optimizer.zero_grad()
 
             if bn % 1 == 0:
-                print("[{}] batch {}/{}: loss = {:5f} | loss_ts = {:5f}".format(str(datetime.now()), bn, num_batches, loss, loss_ts))
+                # print("[{}] batch {}/{}: loss = {:5f} | loss_ts = {:5f} | loss_da = {:5f} | loss_ext = {:5f}".
+                #     format(str(datetime.now()), bn, num_batches, loss, loss_ts, loss_da, loss_ext))
+                print("[{}] batch {}/{}: loss = {:5f}".
+                    format(str(datetime.now()), bn, num_batches, loss))
                 sys.stdout.flush()
+
 
             if bn % 20 == 0:
 
@@ -263,7 +299,7 @@ def evaluate(model, eval_data, eval_batch_size, args, device):
 
     for bn in range(num_eval_epochs):
 
-        input, u_len, w_len, target, tgt_len, _ = get_a_batch(
+        input, u_len, w_len, target, tgt_len, _, _, _ = get_a_batch(
                 eval_data, eval_idx, eval_batch_size,
                 args['num_utterances'], args['num_words'],
                 args['summary_length'], args['summary_type'], device)
@@ -273,7 +309,7 @@ def evaluate(model, eval_data, eval_batch_size, args, device):
         decoder_target = decoder_target.view(-1)
         decoder_mask = decoder_mask.view(-1)
 
-        decoder_output, _ = model(input, u_len, w_len, target)
+        decoder_output, _, _ = model(input, u_len, w_len, target)
 
         loss = criterion(decoder_output.view(-1, args['vocab_size']), decoder_target)
         eval_total_loss += (loss * decoder_mask).sum().item()
@@ -340,6 +376,12 @@ def get_a_batch(ami_data, idx, batch_size, num_utterances, num_words, summary_le
     # topic boundaries
     topic_boundary_label = torch.zeros((batch_size, num_utterances), dtype=torch.float)
 
+    # dialogue act
+    dialogue_acts = torch.zeros((batch_size, num_utterances), dtype=torch.long)
+
+    # extractive label
+    extractive_label = torch.zeros((batch_size, num_utterances), dtype=torch.float)
+
     for bn in range(batch_size):
         topic_segments  = ami_data[idx+bn][0]
         if sum_type == 'long':
@@ -359,6 +401,8 @@ def get_a_batch(ami_data, idx, batch_size, num_utterances, num_words, summary_le
                 input[bn,utt_id,:l] = torch.tensor(encoded_words)
                 # word_lengths[bn,utt_id] = torch.tensor(l)
                 word_lengths[bn,utt_id] = l
+                dialogue_acts[bn,utt_id] = DA_MAPPING[utterance.dialogueact]
+                extractive_label[bn,utt_id] = utterance.extsum_label
                 utt_id += 1
                 if utt_id == num_utterances: break
 
@@ -380,13 +424,15 @@ def get_a_batch(ami_data, idx, batch_size, num_utterances, num_words, summary_le
     input   = input.to(device)
     summary = summary.to(device)
     topic_boundary_label = topic_boundary_label.to(device)
+    dialogue_acts = dialogue_acts.to(device)
+    extractive_label = extractive_label.to(device)
 
     # covert numpy to torch tensor (for multiple GPUs purpose)
     utt_lengths = torch.from_numpy(utt_lengths)
     word_lengths = torch.from_numpy(word_lengths)
     summary_lengths = torch.from_numpy(summary_lengths)
 
-    return input, utt_lengths, word_lengths, summary, summary_lengths, topic_boundary_label
+    return input, utt_lengths, word_lengths, summary, summary_lengths, topic_boundary_label, dialogue_acts, extractive_label
 
 def load_ami_data(data_type):
     path = "/home/alta/summary/pm574/summariser1/lib/model_data/ami-191209.{}.pk.bin".format(data_type)

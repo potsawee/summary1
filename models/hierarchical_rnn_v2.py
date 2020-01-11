@@ -44,7 +44,7 @@ class EncoderDecoder(nn.Module):
         enc_output_dict = self.encoder(input, u_len, w_len)
         dec_output = self.decoder(target, enc_output_dict)
 
-        return dec_output, enc_output_dict['gate_z']
+        return dec_output, enc_output_dict['gate_z'], enc_output_dict['u_output']
 
     def decode_beamsearch(self, input, u_len, w_len, decode_dict):
         """
@@ -219,7 +219,6 @@ class EncoderDecoder(nn.Module):
             # print("SCORING: beam{}: score={:2f} --- len={} --- norm_score={}".format(i,score.cpu().numpy().item(), timesteps, scores[i]))
             # pdb.set_trace()
         return scores
-
 
 class HierarchicalGRU(nn.Module):
     def __init__(self, vocab_size, embedding_dim, rnn_hidden_size, num_layers, dropout, device):
@@ -483,3 +482,23 @@ class DecoderGRU(nn.Module):
     def init_h0(self, batch_size):
         h0 = torch.zeros((batch_size, self.num_layers, self.dec_hidden_size)).to(self.device)
         return h0
+
+class DALabeller(nn.Module):
+    def __init__(self, rnn_hidden_size, num_da_acts, device):
+        super(DALabeller, self).__init__()
+        self.linear = nn.Linear(rnn_hidden_size, num_da_acts, bias=True)
+        self.logsoftmax = nn.LogSoftmax(dim=-1)
+        self.to(device)
+
+    def forward(self, utt_output):
+        return self.logsoftmax(self.linear(utt_output))
+
+class EXTLabeller(nn.Module):
+    def __init__(self, rnn_hidden_size, device):
+        super(EXTLabeller, self).__init__()
+        self.linear = nn.Linear(rnn_hidden_size, 1, bias=True)
+        self.sigmoid = nn.Sigmoid()
+        self.to(device)
+
+    def forward(self, utt_output):
+        return self.sigmoid(self.linear(utt_output))
