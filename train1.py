@@ -48,9 +48,9 @@ def train1():
     args['label_smoothing'] = 0.1
 
     args['model_save_dir'] = "/home/alta/summary/pm574/summariser1/lib/trained_models/"
-    # args['load_model'] = "/home/alta/summary/pm574/summariser1/lib/trained_models/model-HGRU_DEC17B-ep25.pt"
+    # args['load_model'] = "/home/alta/summary/pm574/summariser1/lib/trained_models/model-HGRUV2_JAN10A-ep40" # add .pt later
     args['load_model'] = None
-    args['model_name'] = 'HGRUV2_JAN11A_100'
+    args['model_name'] = 'HGRUV2_JAN14A'
     # ---------------------------------------------------------------------------------- #
     print_config(args)
 
@@ -67,7 +67,7 @@ def train1():
                 write_multi_sl(args['model_name'])
         else:
             print('running locally...')
-            os.environ["CUDA_VISIBLE_DEVICES"] = '1,2' # choose the device (GPU) here
+            os.environ["CUDA_VISIBLE_DEVICES"] = '0,1' # choose the device (GPU) here
         device = 'cuda'
     else:
         device = 'cpu'
@@ -84,9 +84,9 @@ def train1():
         train_data = load_ami_data('train')
         valid_data = load_ami_data('valid')
         # make the training data 100
-        random.shuffle(valid_data)
-        train_data.extend(valid_data[:6])
-        valid_data = valid_data[6:]
+        # random.shuffle(valid_data)
+        # train_data.extend(valid_data[:6])
+        # valid_data = valid_data[6:]
     elif dataset == 'cnndm':
         import pickle
         args['model_data_dir'] = "/home/alta/summary/pm574/summariser0/lib/model_data/"
@@ -109,11 +109,20 @@ def train1():
     if torch.cuda.device_count() > 1:
         print("Multiple GPUs: {}".format(torch.cuda.device_count()))
         model = nn.DataParallel(model)
+        da_labeller = nn.DataParallel(da_labeller)
+        ext_labeller = nn.DataParallel(ext_labeller)
 
     # Load model if specified (path to pytorch .pt)
     if args['load_model'] != None:
-        model.load_state_dict(torch.load(args['load_model']))
+        model_path = args['load_model'] + '.pt'
+        da_path = args['load_model'] + '.da.pt'
+        ext_path = args['load_model'] + '.ext.pt'
+        model.load_state_dict(torch.load(model_path))
+        da_labeller.load_state_dict(torch.load(da_path))
+        ext_labeller.load_state_dict(torch.load(ext_path))
         model.train()
+        da_labeller.train()
+        ext_labeller.train()
         print("Loaded model from {}".format(args['load_model']))
     else:
         print("Train a new model")
@@ -140,13 +149,13 @@ def train1():
     sgd_optimizer = optim.SGD(model.parameters(), lr=args['lr'])
     sgd_optimizer.zero_grad()
 
-    # # DA labeller optimiser
-    # da_optimizer = optim.Adam(da_labeller.parameters(),lr=args['lr'],betas=(0.9,0.999),eps=1e-08,weight_decay=0)
-    # da_optimizer.zero_grad()
-    #
-    # # extractive labeller optimiser
-    # ext_optimizer = optim.Adam(ext_labeller.parameters(),lr=args['lr'],betas=(0.9,0.999),eps=1e-08,weight_decay=0)
-    # ext_optimizer.zero_grad()
+    # DA labeller optimiser
+    da_optimizer = optim.Adam(da_labeller.parameters(),lr=args['lr'],betas=(0.9,0.999),eps=1e-08,weight_decay=0)
+    da_optimizer.zero_grad()
+
+    # extractive labeller optimiser
+    ext_optimizer = optim.Adam(ext_labeller.parameters(),lr=args['lr'],betas=(0.9,0.999),eps=1e-08,weight_decay=0)
+    ext_optimizer.zero_grad()
 
     # validation losses
     best_val_loss = args['best_val_loss']
@@ -184,24 +193,23 @@ def train1():
             loss = criterion(decoder_output.view(-1, args['vocab_size']), decoder_target)
             loss = (loss * decoder_mask).sum() / decoder_mask.sum()
 
-            # # multitask(1): topic segmentation prediction
-            # loss_ts = topic_segment_criterion(gate_z, topic_boundary_label)
-            # loss_ts_mask = length2mask(u_len, BATCH_SIZE, args['num_utterances'], device)
-            # loss_ts = (loss_ts * loss_ts_mask).sum() / loss_ts_mask.sum()
-            #
-            # # multitask(2): dialogue act prediction
-            # da_output = da_labeller(u_output)
-            # loss_da = da_criterion(da_output.view(-1, NUM_DA_TYPES), dialogue_acts.view(-1)).view(BATCH_SIZE, -1)
-            # loss_da = (loss_da * loss_ts_mask).sum() / loss_ts_mask.sum()
-            #
-            # # multitask(3): extractive label prediction
-            # ext_output = ext_labeller(u_output).squeeze(-1)
-            # loss_ext = ext_criterion(ext_output, extractive_label)
-            # loss_ext = (loss_ext * loss_ts_mask).sum() / loss_ts_mask.sum()
-            #
-            # total_loss = loss + loss_ts + loss_da + loss_ext
-            # total_loss.backward()
-            loss.backward()
+            # multitask(1): topic segmentation prediction
+            loss_ts = topic_segment_criterion(gate_z, topic_boundary_label)
+            loss_ts_mask = length2mask(u_len, BATCH_SIZE, args['num_utterances'], device)
+            loss_ts = (loss_ts * loss_ts_mask).sum() / loss_ts_mask.sum()
+
+            # multitask(2): dialogue act prediction
+            da_output = da_labeller(u_output)
+            loss_da = da_criterion(da_output.view(-1, NUM_DA_TYPES), dialogue_acts.view(-1)).view(BATCH_SIZE, -1)
+            loss_da = (loss_da * loss_ts_mask).sum() / loss_ts_mask.sum()
+
+            # multitask(3): extractive label prediction
+            ext_output = ext_labeller(u_output).squeeze(-1)
+            loss_ext = ext_criterion(ext_output, extractive_label)
+            loss_ext = (loss_ext * loss_ts_mask).sum() / loss_ts_mask.sum()
+
+            total_loss = loss + loss_ts + loss_da + loss_ext
+            total_loss.backward()
 
             idx += BATCH_SIZE
 
@@ -210,17 +218,19 @@ def train1():
                     # gradient_clipping
                     max_norm = 0.5
                     nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+                    nn.utils.clip_grad_norm_(da_labeller.parameters(), max_norm)
+                    nn.utils.clip_grad_norm_(ext_labeller.parameters(), max_norm)
                     # update the gradients
                     if args['adjust_lr']:
                         adjust_lr(optimizer, args['initial_lr'], args['decay_rate'], training_step)
-                        # adjust_lr(da_optimizer, args['initial_lr'], args['decay_rate'], training_step)
-                        # adjust_lr(ext_optimizer, args['initial_lr'], args['decay_rate'], training_step)
+                        adjust_lr(da_optimizer, args['initial_lr'], args['decay_rate'], training_step)
+                        adjust_lr(ext_optimizer, args['initial_lr'], args['decay_rate'], training_step)
                     optimizer.step()
                     optimizer.zero_grad()
-                    # da_optimizer.step()
-                    # da_optimizer.zero_grad()
-                    # ext_optimizer.step()
-                    # ext_optimizer.zero_grad()
+                    da_optimizer.step()
+                    da_optimizer.zero_grad()
+                    ext_optimizer.step()
+                    ext_optimizer.zero_grad()
                     training_step += 1
             else:
                 # whole data set update
@@ -230,12 +240,11 @@ def train1():
                     sgd_optimizer.zero_grad()
 
             if bn % 1 == 0:
-                # print("[{}] batch {}/{}: loss = {:5f} | loss_ts = {:5f} | loss_da = {:5f} | loss_ext = {:5f}".
-                #     format(str(datetime.now()), bn, num_batches, loss, loss_ts, loss_da, loss_ext))
-                print("[{}] batch {}/{}: loss = {:5f}".
-                    format(str(datetime.now()), bn, num_batches, loss))
+                print("[{}] batch {}/{}: loss = {:.5f} | loss_ts = {:.5f} | loss_da = {:.5f} | loss_ext = {:.5f}".
+                    format(str(datetime.now()), bn, num_batches, loss, loss_ts, loss_da, loss_ext))
+                # print("[{}] batch {}/{}: loss = {:5f}".
+                #     format(str(datetime.now()), bn, num_batches, loss))
                 sys.stdout.flush()
-
 
             if bn % 20 == 0:
 
@@ -248,26 +257,49 @@ def train1():
                 # ---------------- Evaluate the model on validation data ---------------- #
                 print("Evaluating the model at epoch {} step {}".format(epoch, bn))
                 print("learning_rate = {}".format(optimizer.param_groups[0]['lr']))
-                model.eval() # switch to evaluation mode
+
+                # switch to evaluation mode
+                model.eval()
+                da_labeller.eval()
+                ext_labeller.eval()
+
                 with torch.no_grad():
                     avg_val_loss = evaluate(model, valid_data, VAL_BATCH_SIZE, args, device)
                 print("avg_val_loss_per_token = {}".format(avg_val_loss))
-                model.train() # switch to training mode
+
+                # switch to training mode
+                model.train()
+                da_labeller.train()
+                ext_labeller.train()
                 # ------------------- Save the model OR Stop training ------------------- #
                 if avg_val_loss < best_val_loss:
                     stop_counter = 0
                     best_val_loss = avg_val_loss
                     best_epoch = epoch
+
                     savepath = args['model_save_dir']+"model-{}-ep{}.pt".format(args['model_name'],epoch)
+                    savepath_da = args['model_save_dir']+"model-{}-ep{}.da.pt".format(args['model_name'],epoch)
+                    savepath_ext = args['model_save_dir']+"model-{}-ep{}.ext.pt".format(args['model_name'],epoch)
+
                     torch.save(model.state_dict(), savepath)
+                    torch.save(da_labeller.state_dict(), savepath_da)
+                    torch.save(ext_labeller.state_dict(), savepath_ext)
                     print("Model improved & saved at {}".format(savepath))
                 else:
                     print("Model not improved #{}".format(stop_counter))
                     if stop_counter < VAL_STOP_TRAINING:
                         # load the previous model
                         latest_model = args['model_save_dir']+"model-{}-ep{}.pt".format(args['model_name'],best_epoch)
+                        latest_model_da = args['model_save_dir']+"model-{}-ep{}.da.pt".format(args['model_name'],best_epoch)
+                        latest_model_ext = args['model_save_dir']+"model-{}-ep{}.ext.pt".format(args['model_name'],best_epoch)
+
                         model.load_state_dict(torch.load(latest_model))
+                        da_labeller.load_state_dict(torch.load(latest_model_da))
+                        ext_labeller.load_state_dict(torch.load(latest_model_ext))
+
                         model.train()
+                        da_labeller.train()
+                        ext_labeller.train()
                         print("Restored model from {}".format(latest_model))
                         stop_counter += 1
 
