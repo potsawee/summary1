@@ -38,7 +38,7 @@ def train1():
     args['num_epochs']      = 1000
     args['random_seed']     = 39
     args['best_val_loss']     = 1e+10
-    args['val_batch_size']    = 1
+    args['val_batch_size']    = 1 # 1 for now --- evaluate ROUGE
     args['val_stop_training'] = 10
 
     args['lr']         = 0.01
@@ -48,9 +48,9 @@ def train1():
     args['label_smoothing'] = 0.1
 
     args['model_save_dir'] = "/home/alta/summary/pm574/summariser1/lib/trained_models/"
-    # args['load_model'] = "/home/alta/summary/pm574/summariser1/lib/trained_models/model-HGRUV2_JAN10A-ep40" # add .pt later
+    # args['load_model'] = "/home/alta/summary/pm574/summariser1/lib/trained_models/model-HGRUV2_JAN14A-ep36" # add .pt later
     args['load_model'] = None
-    args['model_name'] = 'HGRUV2_JAN14A'
+    args['model_name'] = 'HGRUV2_JAN15C'
     # ---------------------------------------------------------------------------------- #
     print_config(args)
 
@@ -67,7 +67,7 @@ def train1():
                 write_multi_sl(args['model_name'])
         else:
             print('running locally...')
-            os.environ["CUDA_VISIBLE_DEVICES"] = '0,1' # choose the device (GPU) here
+            os.environ["CUDA_VISIBLE_DEVICES"] = '2,3' # choose the device (GPU) here
         device = 'cuda'
     else:
         device = 'cpu'
@@ -188,7 +188,7 @@ def train1():
             decoder_target = decoder_target.view(-1)
             decoder_mask = decoder_mask.view(-1)
 
-            decoder_output, gate_z, u_output = model(input, u_len, w_len, target)
+            decoder_output, gate_z, u_output, scores_u = model(input, u_len, w_len, target)
 
             loss = criterion(decoder_output.view(-1, args['vocab_size']), decoder_target)
             loss = (loss * decoder_mask).sum() / decoder_mask.sum()
@@ -207,6 +207,10 @@ def train1():
             ext_output = ext_labeller(u_output).squeeze(-1)
             loss_ext = ext_criterion(ext_output, extractive_label)
             loss_ext = (loss_ext * loss_ts_mask).sum() / loss_ts_mask.sum()
+
+            # # multitask(3.2): extractive label to control attention at utterance
+            # attn_extsum = (1-extractive_label)*loss_ts_mask
+            # loss_ext_attn = (scores_u.sum(dim=1) * attn_extsum).sum() / loss_ts_mask.sum()
 
             total_loss = loss + loss_ts + loss_da + loss_ext
             total_loss.backward()
@@ -264,7 +268,7 @@ def train1():
                 ext_labeller.eval()
 
                 with torch.no_grad():
-                    avg_val_loss = evaluate(model, valid_data, VAL_BATCH_SIZE, args, device)
+                    avg_val_loss = evaluate(model, valid_data, VAL_BATCH_SIZE, args, device, use_rouge=True)
                 print("avg_val_loss_per_token = {}".format(avg_val_loss))
 
                 # switch to training mode
@@ -318,7 +322,7 @@ def length2mask(length, batch_size, max_len, device):
     mask = mask.to(device)
     return mask
 
-def evaluate(model, eval_data, eval_batch_size, args, device):
+def evaluate(model, eval_data, eval_batch_size, args, device, use_rouge=False):
     # num_eval_epochs = int(eval_data['num_data']/eval_batch_size) + 1
     num_eval_epochs = int(len(eval_data)/eval_batch_size)
 
@@ -327,7 +331,13 @@ def evaluate(model, eval_data, eval_batch_size, args, device):
     eval_total_loss = 0.0
     eval_total_tokens = 0
 
-    criterion = nn.NLLLoss(reduction='none')
+    if not use_rouge:
+        criterion = nn.NLLLoss(reduction='none')
+    else:
+        from rouge import Rouge
+        rouge = Rouge()
+        bert_decoded_outputs = []
+        bert_decoded_targets = []
 
     for bn in range(num_eval_epochs):
 
@@ -341,11 +351,26 @@ def evaluate(model, eval_data, eval_batch_size, args, device):
         decoder_target = decoder_target.view(-1)
         decoder_mask = decoder_mask.view(-1)
 
-        decoder_output, _, _ = model(input, u_len, w_len, target)
+        decoder_output, _, _, _ = model(input, u_len, w_len, target)
 
-        loss = criterion(decoder_output.view(-1, args['vocab_size']), decoder_target)
-        eval_total_loss += (loss * decoder_mask).sum().item()
-        eval_total_tokens += decoder_mask.sum().item()
+        if not use_rouge:
+            loss = criterion(decoder_output.view(-1, args['vocab_size']), decoder_target)
+            eval_total_loss += (loss * decoder_mask).sum().item()
+            eval_total_tokens += decoder_mask.sum().item()
+
+        else: # use rouge
+            if eval_batch_size != 1: raise ValueError("VAL_BATCH_SIZE must be 1 to use ROUGE")
+            decoder_output = decoder_output.view(-1, args['vocab_size'])
+
+            bert_decoded_output = bert_tokenizer.decode(torch.argmax(decoder_output, dim=-1).cpu().numpy())
+            stop_idx = bert_decoded_output.find('[MASK]')
+            bert_decoded_output = bert_decoded_output[:stop_idx]
+            bert_decoded_outputs.append(bert_decoded_output)
+
+            bert_decoded_target = bert_tokenizer.decode(decoder_target.cpu().numpy())
+            stop_idx2 = bert_decoded_target.find('[MASK]')
+            bert_decoded_target = bert_decoded_target[:stop_idx2]
+            bert_decoded_targets.append(bert_decoded_target)
 
         eval_idx += eval_batch_size
 
@@ -353,8 +378,13 @@ def evaluate(model, eval_data, eval_batch_size, args, device):
         sys.stdout.flush()
 
     print()
-    avg_eval_loss = eval_total_loss / eval_total_tokens
-    return avg_eval_loss
+
+    if not use_rouge:
+        avg_eval_loss = eval_total_loss / eval_total_tokens
+        return avg_eval_loss
+    else:
+        scores = rouge.get_scores(bert_decoded_outputs, bert_decoded_targets, avg=True)
+        return (scores['rouge-1']['f'] + scores['rouge-2']['f'] + scores['rouge-l']['f'])*(-100)/3
 
 def adjust_lr(optimizer, lr0, decay_rate, step):
     """to adjust the learning rate for both encoder & decoder --- DECAY"""
