@@ -42,9 +42,9 @@ class EncoderDecoder(nn.Module):
 
     def forward(self, input, u_len, w_len, target):
         enc_output_dict = self.encoder(input, u_len, w_len)
-        dec_output = self.decoder(target, enc_output_dict)
+        dec_output, scores_u = self.decoder(target, enc_output_dict)
 
-        return dec_output, enc_output_dict['gate_z'], enc_output_dict['u_output']
+        return dec_output, enc_output_dict['gate_z'], enc_output_dict['u_output'], scores_u
 
     def decode_beamsearch(self, input, u_len, w_len, decode_dict):
         """
@@ -208,7 +208,7 @@ class EncoderDecoder(nn.Module):
         scores = [None for _ in range(len(beams))]
         for i, seq in enumerate(beams):
             timesteps = seq.size(0)
-            decoder_output = self.decoder(seq.view(1, timesteps), enc_output_dict, logsoftmax=True)
+            decoder_output, _ = self.decoder(seq.view(1, timesteps), enc_output_dict, logsoftmax=True)
 
             score = 0
             for t in range(timesteps-1):
@@ -405,7 +405,7 @@ class DecoderGRU(nn.Module):
         if logsoftmax:
             dec_output = self.logsoftmax(dec_output)
 
-        return dec_output
+        return dec_output, scores_u
 
     def forward_step(self, xt, ht, encoder_output_dict, logsoftmax=True):
         s_output = encoder_output_dict['s_output']
