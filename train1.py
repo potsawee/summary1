@@ -33,13 +33,13 @@ def train1():
     args['num_layers_enc'] = 1    # in total it's num_layers_enc*3 (word/utt/seg)
     args['num_layers_dec'] = 1
 
-    args['batch_size']      = 2
+    args['batch_size']      = 1
     args['update_nbatches'] = 2   # 0 meaning whole batch update & using SGD
-    args['num_epochs']      = 1000
-    args['random_seed']     = 39
+    args['num_epochs']      = 50
+    args['random_seed']     = 28
     args['best_val_loss']     = 1e+10
     args['val_batch_size']    = 1 # 1 for now --- evaluate ROUGE
-    args['val_stop_training'] = 10
+    args['val_stop_training'] = 5
 
     args['lr']         = 0.01
     args['adjust_lr']  = True       # if True overwrite the learning rate above
@@ -47,10 +47,14 @@ def train1():
     args['decay_rate'] = 0.5
     args['label_smoothing'] = 0.1
 
+    args['a_ts'] = 0.2
+    args['a_da'] = 0.0
+    args['a_ext'] = 0.2
+
     args['model_save_dir'] = "/home/alta/summary/pm574/summariser1/lib/trained_models/"
     # args['load_model'] = "/home/alta/summary/pm574/summariser1/lib/trained_models/model-HGRUV2_JAN14A-ep36" # add .pt later
     args['load_model'] = None
-    args['model_name'] = 'HGRUV2_JAN15C'
+    args['model_name'] = 'HGRUV2_JAN21X'
     # ---------------------------------------------------------------------------------- #
     print_config(args)
 
@@ -67,7 +71,7 @@ def train1():
                 write_multi_sl(args['model_name'])
         else:
             print('running locally...')
-            os.environ["CUDA_VISIBLE_DEVICES"] = '2,3' # choose the device (GPU) here
+            os.environ["CUDA_VISIBLE_DEVICES"] = '0,1' # choose the device (GPU) here
         device = 'cuda'
     else:
         device = 'cpu'
@@ -212,7 +216,7 @@ def train1():
             # attn_extsum = (1-extractive_label)*loss_ts_mask
             # loss_ext_attn = (scores_u.sum(dim=1) * attn_extsum).sum() / loss_ts_mask.sum()
 
-            total_loss = loss + loss_ts + loss_da + loss_ext
+            total_loss = loss + args['a_ts']*loss_ts + args['a_da']*loss_da + args['a_ext']*loss_ext
             total_loss.backward()
 
             idx += BATCH_SIZE
@@ -235,7 +239,7 @@ def train1():
                     da_optimizer.zero_grad()
                     ext_optimizer.step()
                     ext_optimizer.zero_grad()
-                    training_step += 1
+                    training_step += args['batch_size']*args['update_nbatches']
             else:
                 # whole data set update
                 if bn == num_batches-1:
@@ -383,8 +387,11 @@ def evaluate(model, eval_data, eval_batch_size, args, device, use_rouge=False):
         avg_eval_loss = eval_total_loss / eval_total_tokens
         return avg_eval_loss
     else:
-        scores = rouge.get_scores(bert_decoded_outputs, bert_decoded_targets, avg=True)
-        return (scores['rouge-1']['f'] + scores['rouge-2']['f'] + scores['rouge-l']['f'])*(-100)/3
+        try:
+            scores = rouge.get_scores(bert_decoded_outputs, bert_decoded_targets, avg=True)
+            return (scores['rouge-1']['f'] + scores['rouge-2']['f'] + scores['rouge-l']['f'])*(-100)/3
+        except ValueError:
+            return 0
 
 def adjust_lr(optimizer, lr0, decay_rate, step):
     """to adjust the learning rate for both encoder & decoder --- DECAY"""
