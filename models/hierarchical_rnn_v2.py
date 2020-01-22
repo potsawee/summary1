@@ -42,9 +42,14 @@ class EncoderDecoder(nn.Module):
 
     def forward(self, input, u_len, w_len, target):
         enc_output_dict = self.encoder(input, u_len, w_len)
-        dec_output, scores_u = self.decoder(target, enc_output_dict)
+        dec_output = self.decoder(target, enc_output_dict)
 
-        return dec_output, enc_output_dict['gate_z'], enc_output_dict['u_output'], scores_u
+        return dec_output, enc_output_dict['gate_z'], enc_output_dict['u_output']
+
+    def forward_scheduled_sampling(self, input, u_len, w_len, target, prob):
+        enc_output_dict = self.encoder(input, u_len, w_len)
+        dec_output = self.decoder.scheduled_sampling(target, enc_output_dict, prob)
+        return dec_output, enc_output_dict['gate_z'], enc_output_dict['u_output']
 
     def decode_beamsearch(self, input, u_len, w_len, decode_dict):
         """
@@ -405,7 +410,7 @@ class DecoderGRU(nn.Module):
         if logsoftmax:
             dec_output = self.logsoftmax(dec_output)
 
-        return dec_output, scores_u
+        return dec_output
 
     def forward_step(self, xt, ht, encoder_output_dict, logsoftmax=True):
         s_output = encoder_output_dict['s_output']
@@ -480,8 +485,33 @@ class DecoderGRU(nn.Module):
         return dec_output[:,-1,:], ht1
 
     def init_h0(self, batch_size):
-        h0 = torch.zeros((batch_size, self.num_layers, self.dec_hidden_size)).to(self.device)
+        # h0 = torch.zeros((batch_size, self.num_layers, self.dec_hidden_size)).to(self.device)
+        # swap dim 0,1 on 21 January 2020
+        h0 = torch.zeros((self.num_layers, batch_size, self.dec_hidden_size)).to(self.device)
+
         return h0
+
+    def scheduled_sampling(self, target, encoder_output_dict, prob, logsoftmax=True):
+        batch_size = target.size(0)
+        time_step  = target.size(1)
+        ht = self.init_h0(batch_size)
+
+        dec_output = torch.zeros((batch_size, time_step, self.vocab_size)).to(self.device)
+
+        for t in range(time_step):
+            if t > 0:
+                if np.random.random_sample() < prob:
+                    xt = target[:, t:t+1]
+                else:
+                    xt = predict_t.unsqueeze(-1)
+            else:
+                xt = target[:, t:t+1]
+
+            dec_output_t, ht = self.forward_step(xt, ht, encoder_output_dict, logsoftmax)
+            predict_t = torch.argmax(dec_output_t, dim=-1)
+            dec_output[:,t,:] = dec_output_t
+
+        return dec_output
 
 class DALabeller(nn.Module):
     def __init__(self, rnn_hidden_size, num_da_acts, device):

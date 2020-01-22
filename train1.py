@@ -21,10 +21,10 @@ def train1():
     args = {}
     args['use_gpu']        = True
     args['air_multi_gpu']  = False  # to enable running on multiple GPUs on stack
-    args['num_utterances'] = 2000  # max no. utterance in a meeting
-    args['num_words']      = 64    # max no. words in an utterance
-    args['summary_length'] = 800   # max no. words in a summary
-    args['summary_type']   = 'long'   # long or short summary
+    args['num_utterances'] = 1200  # max no. utterance in a meeting
+    args['num_words']      = 50    # max no. words in an utterance
+    args['summary_length'] = 300   # max no. words in a summary
+    args['summary_type']   = 'short'   # long or short summary
     args['vocab_size']     = 30522 # BERT tokenizer
     args['embedding_dim']   = 256   # word embeeding dimension
     args['rnn_hidden_size'] = 512 # RNN hidden size
@@ -35,7 +35,7 @@ def train1():
 
     args['batch_size']      = 1
     args['update_nbatches'] = 2   # 0 meaning whole batch update & using SGD
-    args['num_epochs']      = 50
+    args['num_epochs']      = 25
     args['random_seed']     = 28
     args['best_val_loss']     = 1e+10
     args['val_batch_size']    = 1 # 1 for now --- evaluate ROUGE
@@ -48,13 +48,13 @@ def train1():
     args['label_smoothing'] = 0.1
 
     args['a_ts'] = 0.2
-    args['a_da'] = 0.0
+    args['a_da'] = 0.2
     args['a_ext'] = 0.2
 
     args['model_save_dir'] = "/home/alta/summary/pm574/summariser1/lib/trained_models/"
-    # args['load_model'] = "/home/alta/summary/pm574/summariser1/lib/trained_models/model-HGRUV2_JAN14A-ep36" # add .pt later
-    args['load_model'] = None
-    args['model_name'] = 'HGRUV2_JAN21X'
+    args['load_model'] = "/home/alta/summary/pm574/summariser1/lib/trained_models/model-HGRUV2_JAN16A5n-ep44" # add .pt later
+    # args['load_model'] = None
+    args['model_name'] = 'HGRUV2_JAN22C2'
     # ---------------------------------------------------------------------------------- #
     print_config(args)
 
@@ -71,7 +71,7 @@ def train1():
                 write_multi_sl(args['model_name'])
         else:
             print('running locally...')
-            os.environ["CUDA_VISIBLE_DEVICES"] = '0,1' # choose the device (GPU) here
+            os.environ["CUDA_VISIBLE_DEVICES"] = '0' # choose the device (GPU) here
         device = 'cuda'
     else:
         device = 'cpu'
@@ -180,6 +180,10 @@ def train1():
 
         idx = 0
 
+        # scheduled sampling probability --- start from 1.0 and go to zero
+        sch_prob = 0.5*(1 - (epoch/NUM_EPOCHS))
+        print("epoch {}: scheduled_sampling_prob = {}".format(epoch, sch_prob))
+
         for bn in range(num_batches):
 
             input, u_len, w_len, target, tgt_len, topic_boundary_label, dialogue_acts, extractive_label = get_a_batch(
@@ -192,7 +196,8 @@ def train1():
             decoder_target = decoder_target.view(-1)
             decoder_mask = decoder_mask.view(-1)
 
-            decoder_output, gate_z, u_output, scores_u = model(input, u_len, w_len, target)
+            # decoder_output, gate_z, u_output = model(input, u_len, w_len, target)
+            decoder_output, gate_z, u_output = model.forward_scheduled_sampling(input, u_len, w_len, target, prob=sch_prob)
 
             loss = criterion(decoder_output.view(-1, args['vocab_size']), decoder_target)
             loss = (loss * decoder_mask).sum() / decoder_mask.sum()
@@ -355,7 +360,7 @@ def evaluate(model, eval_data, eval_batch_size, args, device, use_rouge=False):
         decoder_target = decoder_target.view(-1)
         decoder_mask = decoder_mask.view(-1)
 
-        decoder_output, _, _, _ = model(input, u_len, w_len, target)
+        decoder_output, _, _ = model(input, u_len, w_len, target)
 
         if not use_rouge:
             loss = criterion(decoder_output.view(-1, args['vocab_size']), decoder_target)
@@ -396,8 +401,10 @@ def evaluate(model, eval_data, eval_batch_size, args, device, use_rouge=False):
 def adjust_lr(optimizer, lr0, decay_rate, step):
     """to adjust the learning rate for both encoder & decoder --- DECAY"""
     step = step + 1 # plus 1 to avoid ZeroDivisionError
-    # lr = min(1e-3, 0.05*step**(-1.25))
-    lr = lr0*step**(-decay_rate)
+
+    lr = min(1.77e-6*step, 0.005*step**(-0.5))
+
+    # lr = lr0*step**(-decay_rate)
 
     for param_group in optimizer.param_groups: param_group['lr'] = lr
     return
