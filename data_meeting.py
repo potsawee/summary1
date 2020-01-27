@@ -162,17 +162,17 @@ def rouge_reference_go():
     rouge_reference(dir_in, dir_out, style, sumtype)
 
 def main():
-    ami_dir = "/home/alta/summary/pm574/data/amicorpus/summary_work/v-191203"
-    train_data = get_ami_data(ami_dir, data_type='train', style='manual') # len = 94
-    valid_data = get_ami_data(ami_dir, data_type='valid', style='manual') # len = 20
-    test_data  = get_ami_data(ami_dir, data_type='test',  style='manual') # len = 20
+    ami_dir = "/home/alta/summary/pm574/data/amicorpus/summary_work/v-200127-asr"
+    train_data = get_ami_data(ami_dir, data_type='train', style='asr') # len = 94
+    valid_data = get_ami_data(ami_dir, data_type='valid', style='asr') # len = 20
+    test_data  = get_ami_data(ami_dir, data_type='test',  style='asr') # len = 20
 
-    with open("lib/model_data/ami-191209.train.pk.bin", "wb") as f: pickle.dump(train_data, f)
-    with open("lib/model_data/ami-191209.valid.pk.bin", "wb") as f: pickle.dump(valid_data, f)
-    with open("lib/model_data/ami-191209.test.pk.bin", "wb") as f: pickle.dump(test_data, f)
+    with open("lib/model_data/ami-asr-200127.train.pk.bin", "wb") as f: pickle.dump(train_data, f)
+    with open("lib/model_data/ami-asr-200127.valid.pk.bin", "wb") as f: pickle.dump(valid_data, f)
+    with open("lib/model_data/ami-asr-200127.test.pk.bin", "wb") as f: pickle.dump(test_data, f)
 
     print("process data finished")
 
 if __name__ == "__main__":
-    # main()
-    rouge_reference_go()
+    main()
+    # rouge_reference_go()
