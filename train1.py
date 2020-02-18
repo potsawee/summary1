@@ -8,6 +8,7 @@ import pdb
 import pickle
 import random
 from datetime import datetime
+from collections import OrderedDict
 
 from data_meeting import TopicSegment, Utterance, bert_tokenizer, DA_MAPPING
 from data import cnndm
@@ -21,10 +22,10 @@ def train1():
     args = {}
     args['use_gpu']        = True
     args['air_multi_gpu']  = False  # to enable running on multiple GPUs on stack
-    args['num_utterances'] = 1200  # max no. utterance in a meeting
-    args['num_words']      = 50    # max no. words in an utterance
-    args['summary_length'] = 300   # max no. words in a summary
-    args['summary_type']   = 'short'   # long or short summary
+    args['num_utterances'] = 2000  # max no. utterance in a meeting
+    args['num_words']      = 64    # max no. words in an utterance
+    args['summary_length'] = 800   # max no. words in a summary
+    args['summary_type']   = 'long'   # long or short summary
     args['vocab_size']     = 30522 # BERT tokenizer
     args['embedding_dim']   = 256   # word embeeding dimension
     args['rnn_hidden_size'] = 512 # RNN hidden size
@@ -35,8 +36,8 @@ def train1():
 
     args['batch_size']      = 1
     args['update_nbatches'] = 2   # 0 meaning whole batch update & using SGD
-    args['num_epochs']      = 25
-    args['random_seed']     = 28
+    args['num_epochs']      = 50
+    args['random_seed']     = 30
     args['best_val_loss']     = 1e+10
     args['val_batch_size']    = 1 # 1 for now --- evaluate ROUGE
     args['val_stop_training'] = 5
@@ -47,14 +48,14 @@ def train1():
     args['decay_rate'] = 0.5
     args['label_smoothing'] = 0.1
 
-    args['a_ts'] = 0.2
-    args['a_da'] = 0.2
-    args['a_ext'] = 0.2
+    args['a_ts'] = 0.0
+    args['a_da'] = 0.0
+    args['a_ext'] = 0.0
 
     args['model_save_dir'] = "/home/alta/summary/pm574/summariser1/lib/trained_models/"
-    args['load_model'] = "/home/alta/summary/pm574/summariser1/lib/trained_models/model-HGRUV2_JAN16A5n-ep44" # add .pt later
-    # args['load_model'] = None
-    args['model_name'] = 'HGRUV2_JAN22C2'
+    # args['load_model'] = "/home/alta/summary/pm574/summariser1/lib/trained_models/model-HGRUV2_CNNDM_JAN26A-ep3-bn0" # add .pt later
+    args['load_model'] = None
+    args['model_name'] = 'HGRUV2_FEB18A'
     # ---------------------------------------------------------------------------------- #
     print_config(args)
 
@@ -71,7 +72,7 @@ def train1():
                 write_multi_sl(args['model_name'])
         else:
             print('running locally...')
-            os.environ["CUDA_VISIBLE_DEVICES"] = '0' # choose the device (GPU) here
+            os.environ["CUDA_VISIBLE_DEVICES"] = '1' # choose the device (GPU) here
         device = 'cuda'
     else:
         device = 'cpu'
@@ -82,24 +83,12 @@ def train1():
     torch.manual_seed(args['random_seed'])
     np.random.seed(args['random_seed'])
 
-    dataset = 'ami'
-
-    if dataset == 'ami':
-        train_data = load_ami_data('train')
-        valid_data = load_ami_data('valid')
-        # make the training data 100
-        # random.shuffle(valid_data)
-        # train_data.extend(valid_data[:6])
-        # valid_data = valid_data[6:]
-    elif dataset == 'cnndm':
-        import pickle
-        args['model_data_dir'] = "/home/alta/summary/pm574/summariser0/lib/model_data/"
-        args['max_pos_embed']      = 512
-        args['max_num_sentences']  = 32
-        args['max_summary_length'] = args['summary_length']
-        train_data = load_cnndm_data(args, 'trainx', dump=False)
-        valid_data = load_cnndm_data(args, 'valid',  dump=False)
-    print("{} loaded".format(dataset))
+    train_data = load_ami_data('train')
+    valid_data = load_ami_data('valid')
+    # make the training data 100
+    # random.shuffle(valid_data)
+    # train_data.extend(valid_data[:6])
+    # valid_data = valid_data[6:]
 
     model = EncoderDecoder(args, device=device)
     print(model)
@@ -121,9 +110,30 @@ def train1():
         model_path = args['load_model'] + '.pt'
         da_path = args['load_model'] + '.da.pt'
         ext_path = args['load_model'] + '.ext.pt'
-        model.load_state_dict(torch.load(model_path))
-        da_labeller.load_state_dict(torch.load(da_path))
-        ext_labeller.load_state_dict(torch.load(ext_path))
+        try:
+            model.load_state_dict(torch.load(model_path))
+            da_labeller.load_state_dict(torch.load(da_path))
+            ext_labeller.load_state_dict(torch.load(ext_path))
+        except RuntimeError: # need to remove module
+            # Main model
+            model_state_dict = torch.load(model_path)
+            new_model_state_dict = OrderedDict()
+            for key in model_state_dict.keys():
+                new_model_state_dict[key.replace("module.","")] = model_state_dict[key]
+            model.load_state_dict(new_model_state_dict)
+            # DA model
+            # model_state_dict = torch.load(da_path)
+            # new_model_state_dict = OrderedDict()
+            # for key in model_state_dict.keys():
+            #     new_model_state_dict[key.replace("module.","")] = model_state_dict[key]
+            # da_labeller.load_state_dict(new_model_state_dict)
+            # EXT model
+            # model_state_dict = torch.load(ext_path)
+            # new_model_state_dict = OrderedDict()
+            # for key in model_state_dict.keys():
+            #     new_model_state_dict[key.replace("module.","")] = model_state_dict[key]
+            # ext_labeller.load_state_dict(new_model_state_dict)
+
         model.train()
         da_labeller.train()
         ext_labeller.train()
@@ -181,8 +191,8 @@ def train1():
         idx = 0
 
         # scheduled sampling probability --- start from 1.0 and go to zero
-        sch_prob = 0.5*(1 - (epoch/NUM_EPOCHS))
-        print("epoch {}: scheduled_sampling_prob = {}".format(epoch, sch_prob))
+        # sch_prob = 0.5*(1 - (epoch/NUM_EPOCHS))
+        # print("epoch {}: scheduled_sampling_prob = {}".format(epoch, sch_prob))
 
         for bn in range(num_batches):
 
@@ -196,8 +206,8 @@ def train1():
             decoder_target = decoder_target.view(-1)
             decoder_mask = decoder_mask.view(-1)
 
-            # decoder_output, gate_z, u_output = model(input, u_len, w_len, target)
-            decoder_output, gate_z, u_output = model.forward_scheduled_sampling(input, u_len, w_len, target, prob=sch_prob)
+            decoder_output, gate_z, u_output = model(input, u_len, w_len, target)
+            # decoder_output, gate_z, u_output = model.forward_scheduled_sampling(input, u_len, w_len, target, prob=sch_prob)
 
             loss = criterion(decoder_output.view(-1, args['vocab_size']), decoder_target)
             loss = (loss * decoder_mask).sum() / decoder_mask.sum()
@@ -226,31 +236,24 @@ def train1():
 
             idx += BATCH_SIZE
 
-            if args['update_nbatches'] != 0:
-                if bn % args['update_nbatches'] == 0:
-                    # gradient_clipping
-                    max_norm = 0.5
-                    nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-                    nn.utils.clip_grad_norm_(da_labeller.parameters(), max_norm)
-                    nn.utils.clip_grad_norm_(ext_labeller.parameters(), max_norm)
-                    # update the gradients
-                    if args['adjust_lr']:
-                        adjust_lr(optimizer, args['initial_lr'], args['decay_rate'], training_step)
-                        adjust_lr(da_optimizer, args['initial_lr'], args['decay_rate'], training_step)
-                        adjust_lr(ext_optimizer, args['initial_lr'], args['decay_rate'], training_step)
-                    optimizer.step()
-                    optimizer.zero_grad()
-                    da_optimizer.step()
-                    da_optimizer.zero_grad()
-                    ext_optimizer.step()
-                    ext_optimizer.zero_grad()
-                    training_step += args['batch_size']*args['update_nbatches']
-            else:
-                # whole data set update
-                if bn == num_batches-1:
-                    # update the gradients
-                    sgd_optimizer.step()
-                    sgd_optimizer.zero_grad()
+            if bn % args['update_nbatches'] == 0:
+                # gradient_clipping
+                max_norm = 0.5
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+                nn.utils.clip_grad_norm_(da_labeller.parameters(), max_norm)
+                nn.utils.clip_grad_norm_(ext_labeller.parameters(), max_norm)
+                # update the gradients
+                if args['adjust_lr']:
+                    adjust_lr(optimizer, args['initial_lr'], args['decay_rate'], training_step)
+                    adjust_lr(da_optimizer, args['initial_lr'], args['decay_rate'], training_step)
+                    adjust_lr(ext_optimizer, args['initial_lr'], args['decay_rate'], training_step)
+                optimizer.step()
+                optimizer.zero_grad()
+                da_optimizer.step()
+                da_optimizer.zero_grad()
+                ext_optimizer.step()
+                ext_optimizer.zero_grad()
+                training_step += args['batch_size']*args['update_nbatches']
 
             if bn % 1 == 0:
                 print("[{}] batch {}/{}: loss = {:.5f} | loss_ts = {:.5f} | loss_da = {:.5f} | loss_ext = {:.5f}".
@@ -278,6 +281,8 @@ def train1():
 
                 with torch.no_grad():
                     avg_val_loss = evaluate(model, valid_data, VAL_BATCH_SIZE, args, device, use_rouge=True)
+                    # avg_val_loss = evaluate_beam(model, valid_data, VAL_BATCH_SIZE, args, device, use_rouge=True)
+
                 print("avg_val_loss_per_token = {}".format(avg_val_loss))
 
                 # switch to training mode
@@ -398,13 +403,80 @@ def evaluate(model, eval_data, eval_batch_size, args, device, use_rouge=False):
         except ValueError:
             return 0
 
+def evaluate_beam(model, eval_data, eval_batch_size, args, device, use_rouge=False):
+    # num_eval_epochs = int(eval_data['num_data']/eval_batch_size) + 1
+    num_eval_epochs = int(len(eval_data)/eval_batch_size)
+
+    print("num_eval_epochs = {}".format(num_eval_epochs))
+    eval_idx = 0
+    eval_total_loss = 0.0
+    eval_total_tokens = 0
+
+    from rouge import Rouge
+    rouge = Rouge()
+    bert_decoded_outputs = []
+    bert_decoded_targets = []
+
+    decode_dict = {
+        'k': 10, 'search_method': 'argmax',
+        'time_step': args['summary_length'], 'vocab_size': 30522,
+        'device': device, 'start_token_id': 101,
+        'stop_token_id': 103,
+        'alpha': 1.5, 'length_offset': 5,
+        'penalty_ug': 0,
+        'keypadmask_dtype': torch.bool,
+        'batch_size': 1
+        }
+
+    for bn in range(num_eval_epochs):
+
+        input, u_len, w_len, target, tgt_len, _, _, _ = get_a_batch(
+                eval_data, eval_idx, eval_batch_size,
+                args['num_utterances'], args['num_words'],
+                args['summary_length'], args['summary_type'], device)
+
+        # decoder target
+        decoder_target, decoder_mask = shift_decoder_target(target, tgt_len, device)
+        decoder_target = decoder_target.view(-1)
+        decoder_mask = decoder_mask.view(-1)
+
+        # Inference time decoding
+        sys.stdout = open(os.devnull, 'w')
+        summaries_id = model.decode_beamsearch(input, u_len, w_len, decode_dict)
+        summaries_id = summaries_id[0][1:]
+
+        bert_decoded_output = bert_tokenizer.decode(summaries_id)
+        stop_idx = bert_decoded_output.find('[MASK]')
+        bert_decoded_output = bert_decoded_output[:stop_idx]
+        bert_decoded_outputs.append(bert_decoded_output)
+
+        bert_decoded_target = bert_tokenizer.decode(decoder_target.cpu().numpy())
+        stop_idx2 = bert_decoded_target.find('[MASK]')
+        bert_decoded_target = bert_decoded_target[:stop_idx2]
+        bert_decoded_targets.append(bert_decoded_target)
+        sys.stdout = sys.__stdout__
+
+        eval_idx += eval_batch_size
+
+        print("#", end="")
+        sys.stdout.flush()
+
+    print()
+
+    try:
+        scores = rouge.get_scores(bert_decoded_outputs, bert_decoded_targets, avg=True)
+        return (scores['rouge-1']['f'] + scores['rouge-2']['f'] + scores['rouge-l']['f'])*(-100)/3
+    except ValueError:
+        return 0
+
+
 def adjust_lr(optimizer, lr0, decay_rate, step):
     """to adjust the learning rate for both encoder & decoder --- DECAY"""
     step = step + 1 # plus 1 to avoid ZeroDivisionError
 
-    lr = min(1.77e-6*step, 0.005*step**(-0.5))
+    # lr = min(1.77e-6*step, 0.005*step**(-0.5))
 
-    # lr = lr0*step**(-decay_rate)
+    lr = lr0*step**(-decay_rate)
 
     for param_group in optimizer.param_groups: param_group['lr'] = lr
     return

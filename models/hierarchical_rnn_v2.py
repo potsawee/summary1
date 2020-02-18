@@ -213,7 +213,7 @@ class EncoderDecoder(nn.Module):
         scores = [None for _ in range(len(beams))]
         for i, seq in enumerate(beams):
             timesteps = seq.size(0)
-            decoder_output, _ = self.decoder(seq.view(1, timesteps), enc_output_dict, logsoftmax=True)
+            decoder_output = self.decoder(seq.view(1, timesteps), enc_output_dict, logsoftmax=True)
 
             score = 0
             for t in range(timesteps-1):
@@ -335,6 +335,7 @@ class DecoderGRU(nn.Module):
         self.attention_u = nn.Linear(mem_hidden_size, dec_hidden_size)
         self.attention_w = nn.Linear(2*mem_hidden_size, dec_hidden_size)
         self.attn_softmax = nn.Softmax(dim=-1)
+        # self.attn_logsoftmax = nn.LogSoftmax(dim=-1)
 
 
         self.output_layer = nn.Linear(dec_hidden_size+2*mem_hidden_size, vocab_size, bias=True)
@@ -351,9 +352,15 @@ class DecoderGRU(nn.Module):
         segment_indices = encoder_output_dict['segment_indices']
         utt_indices     = encoder_output_dict['utt_indices']
 
+        batch_size = target.size(0)
 
         embed = self.embedding(target)
+        # initial hidden state
+        # initial_h = torch.zeros((self.num_layers, batch_size, self.dec_hidden_size), dtype=torch.float).to(self.device)
+        # for bn, l in enumerate(s_len):
+        #     initial_h[:,bn,:] = s_output[bn,l-1,:].unsqueeze(0)
         self.rnn.flatten_parameters()
+        # rnn_output, _ = self.rnn(embed, initial_h)
         rnn_output, _ = self.rnn(embed)
 
         # attention mechanism LEVEL --- TopicSegment (s)
@@ -376,7 +383,6 @@ class DecoderGRU(nn.Module):
         scores_w = self.attn_softmax(scores_w)
         scores_suw = torch.zeros(scores_w.shape).to(self.device)
 
-        batch_size = target.size(0)
         # Segment -> Utterance
         for bn in range(batch_size):
             idx1 = 0
@@ -389,7 +395,7 @@ class DecoderGRU(nn.Module):
             for i in range(len(segment_indices[bn])):
                 i1 = start_indices[i]
                 i2 = end_indices[i]+1 # python
-                scores_su[bn, :, i1:i2] = scores_s[bn, :, i].unsqueeze(-1)*scores_u[bn, :, i1:i2]
+                scores_su[bn, :, i1:i2] = scores_s[bn, :, i].unsqueeze(-1) * scores_u[bn, :, i1:i2]
 
         # Utterance -> Word
         for bn in range(batch_size):
@@ -400,9 +406,9 @@ class DecoderGRU(nn.Module):
             for i in range(len(utt_indices[bn])):
                 i1 = start_indices[i]
                 i2 = end_indices[i]+1 # python
-                scores_suw[bn, :, i1:i2] = scores_su[bn, :, i].unsqueeze(-1)*scores_w[bn, :, i1:i2]
-
+                scores_suw[bn, :, i1:i2] = scores_su[bn, :, i].unsqueeze(-1) * scores_w[bn, :, i1:i2]
         scores_suw = self.attn_softmax(scores_suw)
+        pdb.set_trace()
         context_vec = torch.bmm(scores_suw, w_output)
 
         dec_output = self.output_layer(torch.cat((context_vec, rnn_output), dim=-1))
@@ -461,7 +467,7 @@ class DecoderGRU(nn.Module):
             for i in range(len(segment_indices[bn])):
                 i1 = start_indices[i]
                 i2 = end_indices[i]+1 # python
-                scores_su[bn, :, i1:i2] = scores_s[bn, :, i].unsqueeze(-1)*scores_u[bn, :, i1:i2]
+                scores_su[bn, :, i1:i2] = scores_s[bn, :, i].unsqueeze(-1) * scores_u[bn, :, i1:i2]
 
         # Utterance -> Word
         for bn in range(batch_size):
@@ -472,12 +478,13 @@ class DecoderGRU(nn.Module):
             for i in range(len(utt_indices[bn])):
                 i1 = start_indices[i]
                 i2 = end_indices[i]+1 # python
-                scores_suw[bn, :, i1:i2] = scores_su[bn, :, i].unsqueeze(-1)*scores_w[bn, :, i1:i2]
+                scores_suw[bn, :, i1:i2] = scores_su[bn, :, i].unsqueeze(-1) * scores_w[bn, :, i1:i2]
 
         scores_suw = self.attn_softmax(scores_suw)
         context_vec = torch.bmm(scores_suw, w_output)
 
         dec_output = self.output_layer(torch.cat((context_vec, rnn_output), dim=-1))
+
 
         if logsoftmax:
             dec_output = self.logsoftmax(dec_output)
