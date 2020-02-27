@@ -14,7 +14,7 @@ from data import cnndm
 from data.cnndm import ProcessedDocument, ProcessedSummary
 from models.hierarchical_rnn_v5 import EncoderDecoder, DALabeller, EXTLabeller
 from models.neural import LabelSmoothingLoss
-from mbr_criterion import grad_sampling
+from mbr_criterion import grad_sampling, beamsearch_approx
 
 def train_mbr():
     print("Start training hierarchical RNN model")
@@ -23,7 +23,7 @@ def train_mbr():
     args['use_gpu']        = True
     args['num_utterances'] = 1200  # max no. utterance in a meeting
     args['num_words']      = 50    # max no. words in an utterance
-    args['summary_length'] = 250   # max no. words in a summary
+    args['summary_length'] = 300   # max no. words in a summary
     args['summary_type']   = 'short'   # long or short summary
     args['vocab_size']     = 30522 # BERT tokenizer
     args['embedding_dim']   = 256   # word embeeding dimension
@@ -35,29 +35,30 @@ def train_mbr():
 
     args['batch_size']      = 1
     args['update_nbatches'] = 1
-    args['num_epochs']      = 50
-    args['random_seed']     = 28
+    args['num_epochs']      = 10
+    args['random_seed']     = 88
     args['best_val_loss']     = 1e+10
     args['val_batch_size']    = 1 # 1 for now --- evaluate ROUGE
-    args['val_stop_training'] = 10
+    args['val_stop_training'] = 50
 
-    args['lr']         = 0.05
+    args['lr']         = 1e-3
     args['adjust_lr']  = False     # if True overwrite the learning rate above
     args['initial_lr'] = 0.2       # lr = lr_0*step^(-decay_rate)
     args['decay_rate'] = 0.5
-    args['label_smoothing'] = 0.1
 
     args['a_ts']  = 0.0
     args['a_da']  = 0.0
     args['a_ext'] = 0.0
     args['a_cov'] = 0.0
 
-    args['num_samples'] = 5
+    args['N']      = 10
+    args['lambda'] = 0.0
 
     args['model_save_dir'] = "/home/alta/summary/pm574/summariser1/lib/trained_models2/"
     args['load_model'] = "/home/alta/summary/pm574/summariser1/lib/trained_models2/model-HGRUV5_FEB25A-ep8" # add .pt later
+    # args['load_model'] = "/home/alta/summary/pm574/summariser1/lib/trained_models2/model-HGRUV5_CNNDM_FEB26A-ep8-bn2000" # add .pt later
     # args['load_model'] = None
-    args['model_name'] = 'MBR_GS_FEB25A2'
+    args['model_name'] = 'MBR_GS_FEB27C'
     # ---------------------------------------------------------------------------------- #
     print_config(args)
 
@@ -121,11 +122,8 @@ def train_mbr():
     VAL_BATCH_SIZE = args['val_batch_size']
     VAL_STOP_TRAINING = args['val_stop_training']
 
-    if args['label_smoothing'] > 0.0:
-        criterion = LabelSmoothingLoss(num_classes=args['vocab_size'],
-                        smoothing=args['label_smoothing'], reduction='none')
-    else:
-        criterion = nn.NLLLoss(reduction='none')
+    # Cross-Entropy
+    ce_criterion = nn.NLLLoss(reduction='none')
 
     # we use two separate optimisers (encoder & decoder)
     optimizer = optim.Adam(model.parameters(),lr=args['lr'],betas=(0.9,0.999),eps=1e-08,weight_decay=0)
@@ -158,16 +156,26 @@ def train_mbr():
 
             # decoder target
             decoder_target, decoder_mask = shift_decoder_target(target, tgt_len, device, mask_offset=True)
-
-            if bn % 5 == 0:
-                printout = True
-            else:
-                printout = False
-
+            # LOSS - Minimum Bayes Risk
+            if bn % 1 == 0: printout = True
+            else: printout = False
             R1, R2, RL = grad_sampling(model,
                                 input, u_len, w_len, decoder_target,
-                                num_samples=args['num_samples'], time_step=args['summary_length'],
+                                num_samples=args['N'], lambda1=args['lambda'],
                                 device=device, printout=printout)
+
+            # LOSS - Croos Entropy
+            decoder_target = decoder_target.view(-1)
+            decoder_mask = decoder_mask.view(-1)
+            decoder_output, _, _, _ = model(input, u_len, w_len, target)
+            loss = ce_criterion(decoder_output.view(-1, args['vocab_size']), decoder_target)
+            loss = (loss * decoder_mask).sum() / decoder_mask.sum()
+            loss.backward()
+
+            # R1, R2, RL = beamsearch_approx(model,
+            #                     input, u_len, w_len, decoder_target,
+            #                     beam_width=args['N'],
+            #                     device=device, printout=printout)
 
             idx += BATCH_SIZE
 
@@ -180,12 +188,12 @@ def train_mbr():
                 training_step += args['batch_size']*args['update_nbatches']
 
             if bn % 1 == 0:
-                print("[{}] batch {}/{}: R1={:.2f} | R2={:.2f} | RL = {:.2f}".
-                        format(str(datetime.now()), bn, num_batches, R1*100, R2*100, RL*100))
+                print("[{}] batch {}/{}: loss = {:.5f} | R1={:.2f} | R2={:.2f} | RL = {:.2f}".
+                        format(str(datetime.now()), bn, num_batches, loss, R1*100, R2*100, RL*100))
                 print("-----------------------------------------------------------------------------------------")
                 sys.stdout.flush()
 
-            if bn == 0: # e.g. eval every epoch
+            if bn % 19 == 0: # e.g. eval every epoch
                 # ---------------- Evaluate the model on validation data ---------------- #
                 print("Evaluating the model at epoch {} step {}".format(epoch, bn))
                 print("learning_rate = {}".format(optimizer.param_groups[0]['lr']))
@@ -194,7 +202,8 @@ def train_mbr():
                 model.eval()
 
                 with torch.no_grad():
-                    avg_val_loss = evaluate(model, valid_data, VAL_BATCH_SIZE, args, device, use_rouge=True)
+                    avg_val_loss = evaluate_greedy(model, valid_data, VAL_BATCH_SIZE, args, device)
+                    # avg_val_loss = evaluate(model, valid_data, VAL_BATCH_SIZE, args, device, use_rouge=True)
 
                 print("avg_val_loss_per_token = {}".format(avg_val_loss))
 
@@ -206,7 +215,7 @@ def train_mbr():
                     best_val_loss = avg_val_loss
                     best_epoch = epoch
 
-                    savepath = args['model_save_dir']+"model-{}-ep{}.pt".format(args['model_name'],epoch)
+                    savepath = args['model_save_dir']+"model-{}-ep{}-bn{}.pt".format(args['model_name'],epoch,bn)
 
                     torch.save(model.state_dict(), savepath)
                     print("Model improved & saved at {}".format(savepath))
@@ -273,11 +282,13 @@ def evaluate(model, eval_data, eval_batch_size, args, device, use_rouge=False):
             bert_decoded_output = bert_tokenizer.decode(torch.argmax(decoder_output, dim=-1).cpu().numpy())
             stop_idx = bert_decoded_output.find('[MASK]')
             bert_decoded_output = bert_decoded_output[:stop_idx]
+            bert_decoded_output = bert_decoded_output.replace('[SEP] ', '')
             bert_decoded_outputs.append(bert_decoded_output)
 
             bert_decoded_target = bert_tokenizer.decode(decoder_target.cpu().numpy())
             stop_idx2 = bert_decoded_target.find('[MASK]')
             bert_decoded_target = bert_decoded_target[:stop_idx2]
+            bert_decoded_target = bert_decoded_target.replace('[SEP] ', '')
             bert_decoded_targets.append(bert_decoded_target)
 
         eval_idx += eval_batch_size
@@ -296,6 +307,80 @@ def evaluate(model, eval_data, eval_batch_size, args, device, use_rouge=False):
             return (scores['rouge-1']['f'] + scores['rouge-2']['f'] + scores['rouge-l']['f'])*(-100)/3
         except ValueError:
             return 0
+
+def evaluate_greedy(model, eval_data, eval_batch_size, args, device):
+    num_eval_epochs = int(len(eval_data)/eval_batch_size)
+
+    print("num_eval_epochs = {}".format(num_eval_epochs))
+    eval_idx = 0
+
+    from rouge import Rouge
+    rouge = Rouge()
+    bert_decoded_outputs = []
+    bert_decoded_targets = []
+
+    for bn in range(num_eval_epochs):
+
+        input, u_len, w_len, target, tgt_len, _, _, _ = get_a_batch(
+                eval_data, eval_idx, eval_batch_size,
+                args['num_utterances'], args['num_words'],
+                args['summary_length'], args['summary_type'], device)
+
+        # decoder target
+        decoder_target, decoder_mask = shift_decoder_target(target, tgt_len, device)
+        decoder_target = decoder_target.view(-1)
+
+        enc_output_dict = model.encoder(input, u_len, w_len) # memory
+        u_output = enc_output_dict['u_output']
+
+        # forward-pass DECODER
+        xt = torch.zeros((eval_batch_size, 1), dtype=torch.int64).to(device)
+        xt.fill_(101) # 101
+
+        # initial hidden state
+        ht = torch.zeros((model.decoder.num_layers, eval_batch_size, model.decoder.dec_hidden_size),
+                                    dtype=torch.float).to(device)
+        for bi, l in enumerate(u_len): ht[:,bi,:] = u_output[bi,l-1,:].unsqueeze(0)
+
+        decoded_words = [103 for _ in range(args['summary_length'])]
+
+        for t in range(args['summary_length']-1):
+            decoder_output, ht, _ = model.decoder.forward_step(xt, ht, enc_output_dict, logsoftmax=True)
+            next_word = decoder_output.argmax().item()
+            xt.fill_(next_word)
+            decoded_words[t] = next_word
+
+        bert_decoded_output = bert_tokenizer.decode(decoded_words)
+        stop_idx = bert_decoded_output.find('[MASK]')
+        bert_decoded_output = bert_decoded_output[:stop_idx]
+        bert_decoded_output = bert_decoded_output.replace('[SEP] ', '')
+        bert_decoded_outputs.append(bert_decoded_output)
+
+        bert_decoded_target = bert_tokenizer.decode(decoder_target.cpu().numpy())
+        stop_idx2 = bert_decoded_target.find('[MASK]')
+        bert_decoded_target = bert_decoded_target[:stop_idx2]
+        bert_decoded_target = bert_decoded_target.replace('[SEP] ', '')
+        bert_decoded_targets.append(bert_decoded_target)
+
+        eval_idx += eval_batch_size
+
+        print("#", end="")
+        sys.stdout.flush()
+
+    print()
+
+    try:
+        scores = rouge.get_scores(bert_decoded_outputs, bert_decoded_targets, avg=True)
+        print("--------------------------------------------------")
+        print("ROUGE-1 = {:.2f}".format(scores['rouge-1']['f']*100))
+        print("ROUGE-2 = {:.2f}".format(scores['rouge-2']['f']*100))
+        print("ROUGE-L = {:.2f}".format(scores['rouge-l']['f']*100))
+        print("--------------------------------------------------")
+
+        return (scores['rouge-1']['f'] + scores['rouge-2']['f'] + scores['rouge-l']['f'])*(-100)/3
+    except ValueError:
+        print("cannot compute ROUGE score")
+        return 0
 
 def adjust_lr(optimizer, lr0, decay_rate, step):
     """to adjust the learning rate for both encoder & decoder --- DECAY"""

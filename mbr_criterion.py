@@ -34,6 +34,9 @@ def grad_sampling(model, input, u_len, w_len, target,
         print("reference: {}".format(reference))
         print("-----------------------------------------------------------------------------------------")
 
+    grads   = [None for _ in range(num_samples)]
+    metrics = [None for _ in range(num_samples)]
+
     for i in range(num_samples):
         # forward-pass ENCODER --- need to do forward pass again as autograd freed up memory
         enc_output_dict = model.encoder(input, u_len, w_len) # memory
@@ -71,10 +74,15 @@ def grad_sampling(model, input, u_len, w_len, target,
         if stop_idx != -1: hypothesis = hypothesis[:stop_idx]
 
         # Compute D(y, y_hat)
-        scores = rouge.get_scores(hypothesis, reference)
-        r1 = scores[0]['rouge-1']['f']
-        r2 = scores[0]['rouge-2']['f']
-        rl = scores[0]['rouge-l']['f']
+        try:
+            scores = rouge.get_scores(hypothesis, reference)
+            r1 = scores[0]['rouge-1']['f']
+            r2 = scores[0]['rouge-2']['f']
+            rl = scores[0]['rouge-l']['f']
+        except ValueError:
+            r1 = 0
+            r2 = 0
+            r3 = 0
 
         metric = -1 * (r1+r2+rl) # since we 'minimise' the criterion
 
@@ -88,11 +96,28 @@ def grad_sampling(model, input, u_len, w_len, target,
         total_rl += rl
 
         # scale to gradient by metric
-        log_prob_seq *= metric
-        log_prob_seq *= lambda1
-        log_prob_seq.backward()
+        # log_prob_seq *= metric
+        # log_prob_seq *= lambda1
+        # log_prob_seq.backward()
 
-    for param in model.parameters(): param.grad /= num_samples
+        # len(grad) = the number of model.parameters() --- checked!
+        grad = torch.autograd.grad(log_prob_seq, model.parameters())
+        grads[i] = grad
+        metrics[i] = metric
+
+    mean_x  = sum(metrics) / len(metrics)
+    metrics = [xi - mean_x for xi in metrics]
+
+    # for param in model.parameters(): param.grad /= num_samples
+
+    for i in range(num_samples):
+        for n, param in enumerate(model.parameters()):
+            if i == 0:
+                param.grad  = metrics[i] * grads[i][n]
+            else:
+                param.grad += metrics[i] * grads[i][n]
+
+    for param in model.parameters(): param.grad *= lambda1 / num_samples
 
     r1_avg = total_r1 / num_samples
     r2_avg = total_r2 / num_samples
