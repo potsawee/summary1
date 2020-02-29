@@ -94,6 +94,7 @@ class EncoderDecoder(nn.Module):
 
         # we should only feed through the encoder just once!!
         enc_output_dict = self.encoder(input, u_len, w_len) # memory
+        u_output = enc_output_dict['u_output']
 
         # we run the decoder time_step times (auto-regressive)
         tgt_ids = torch.zeros((batch_size, time_step), dtype=torch.int64).to(device)
@@ -103,7 +104,14 @@ class EncoderDecoder(nn.Module):
 
         finished_beams = [[] for _ in range(batch_size)]
 
-        beam_ht = [self.decoder.init_h0(batch_size) for _ in range(k)]
+
+        # initial hidden state
+        ht = torch.zeros((self.decoder.num_layers, batch_size, self.decoder.dec_hidden_size),
+                                    dtype=torch.float).to(self.device)
+        for bn, l in enumerate(u_len): ht[:,bn,:] = u_output[bn,l-1,:].unsqueeze(0)
+        beam_ht = [None for _ in range(k)]
+        for _k in range(k): beam_ht[_k] = ht.clone()
+
         finish = False
         for t in range(time_step-1):
             if finish: break
@@ -112,7 +120,6 @@ class EncoderDecoder(nn.Module):
             for i, beam in enumerate(beams):
 
                 # inference decoding
-                # decoder_output = self.decoder(beam[:,:t+1], s_output, s_len, logsoftmax=True)[:,-1,:]
                 decoder_output, beam_ht[i], attn_scores = self.decoder.forward_step(beam[:,t:t+1], beam_ht[i], enc_output_dict, logsoftmax=True)
 
                 # print("t = {}: attn_scores = {}".format(t , attn_scores))
@@ -197,6 +204,7 @@ class EncoderDecoder(nn.Module):
             # print("=========================  t = {} =========================".format(t))
             # for ik in range(k):
             #     print("beam{}: [{:.5f}]".format(ik, scores[0,ik]),bert_tokenizer.decode(beams[ik][0].cpu().numpy()[:t+2]))
+            # import pdb; pdb.set_trace()
 
             if (t % 50) == 0:
                 print("{}=".format(t), end="")
@@ -379,7 +387,7 @@ class DecoderGRU(nn.Module):
             dec_output = self.logsoftmax(dec_output)
 
         return dec_output, scores_uw
-        
+
         # FOR multiple GPU training --- cannot have scores_uw (size error)
         return dec_output
 
