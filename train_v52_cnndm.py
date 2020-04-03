@@ -34,19 +34,19 @@ def train_v5():
     args['batch_size']      = 128
     args['update_nbatches'] = 1
     args['num_epochs']      = 40
-    args['random_seed']     = 99
+    args['random_seed']     = 29
     args['best_val_loss']     = 1e+10
     args['val_batch_size']    = 128 # 1 for now --- evaluate ROUGE
     args['val_stop_training'] = 5
 
     args['adjust_lr']  = True     # if True overwrite the learning rate above
     args['initial_lr'] = 0.02     # lr = lr_0*step^(-decay_rate)
-    args['decay_rate'] = 0.25
+    args['decay_rate'] = 0.20
 
     args['model_save_dir'] = "/home/alta/summary/pm574/summariser1/lib/trained_models3/"
     args['load_model'] = "/home/alta/summary/pm574/summariser1/lib/trained_models3/model-HGRUV52_CNNDM_APR2B-ep0.pt" # add .pt later
     # args['load_model'] = None
-    args['model_name'] = 'HGRUV52_CNNDM_APR2B'
+    args['model_name'] = 'HGRUV52_CNNDM_APR2C'
     # ---------------------------------------------------------------------------------- #
     print_config(args)
 
@@ -96,10 +96,13 @@ def train_v5():
                 new_model_state_dict[key.replace("module.","")] = model_state_dict[key]
             model.load_state_dict(new_model_state_dict)
 
-        optimizer.load_state_dict(optimizer_state_dict)
         model.train()
+        optimizer.load_state_dict(optimizer_state_dict)
+        training_step = state['training_step']
         print("Loaded model from {}".format(args['load_model']))
+        print("continue from training_step {}".format(training_step))
     else:
+        training_step = 0
         print("Train a new model")
 
 
@@ -120,7 +123,6 @@ def train_v5():
     best_val_loss = args['best_val_loss']
     best_epoch    = 0
     stop_counter  = 0
-    training_step = 0
 
     optimizer.zero_grad()
 
@@ -135,13 +137,16 @@ def train_v5():
         random.shuffle(train_data)
 
         idx = 0
-
         for bn in range(num_batches):
 
             input, u_len, w_len, target, tgt_len = get_a_batch(
                     train_data, idx, BATCH_SIZE,
                     args['num_utterances'], args['num_words'],
                     args['summary_length'], args['summary_type'], device)
+
+            if u_len.min().item() == 0:
+                print("BN = {}: u_len_min = 0 --- ERROR, just skip this batch!!!".format(bn))
+                continue
 
             # decoder target
             decoder_target, decoder_mask = shift_decoder_target(target, tgt_len, device, mask_offset=True)
