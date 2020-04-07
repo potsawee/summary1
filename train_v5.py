@@ -34,26 +34,27 @@ def train_v5():
 
     args['batch_size']      = 1
     args['update_nbatches'] = 2
-    args['num_epochs']      = 50
-    args['random_seed']     = 28
+    args['num_epochs']      = 30
+    args['random_seed']     = 78
     args['best_val_loss']     = 1e+10
     args['val_batch_size']    = 1 # 1 for now --- evaluate ROUGE
-    args['val_stop_training'] = 10
+    args['val_stop_training'] = 30
 
-    args['lr']         = 0.005
-    args['adjust_lr']  = False     # if True overwrite the learning rate above
-    args['initial_lr'] = 0.2       # lr = lr_0*step^(-decay_rate)
+    args['lr']         = 1.0
+    args['adjust_lr']  = True     # if True overwrite the learning rate above
+    args['initial_lr'] = 0.01       # lr = lr_0*step^(-decay_rate)
     args['decay_rate'] = 0.5
     args['label_smoothing'] = 0.1
 
-    args['a_da']  = 0.2
-    args['a_ext'] = 0.2
-    args['a_cov'] = 1.0
+    args['a_da']  = 0.0
+    args['a_ext'] = 0.0
+    args['a_cov'] = 0.0
 
     args['model_save_dir'] = "/home/alta/summary/pm574/summariser1/lib/trained_models2/"
-    # args['load_model'] = "/home/alta/summary/pm574/summariser1/lib/trained_models/model-HGRUV2_CNNDM_JAN26A-ep3-bn0" # add .pt later
-    args['load_model'] = None
-    args['model_name'] = 'HGRUV5_FEB25X'
+    # args['load_model'] = "/home/alta/summary/pm574/summariser1/lib/trained_models2/model-HGRUV5_CNNDM_FEB26A-ep12-bn0" # add .pt later
+    args['load_model'] = "/home/alta/summary/pm574/summariser1/lib/trained_models2/model-HGRUV5_FEB28A-ep6"
+    # args['load_model'] = None
+    args['model_name'] = 'HGRUV5_MARCH3X'
     # ---------------------------------------------------------------------------------- #
     print_config(args)
 
@@ -65,7 +66,7 @@ def train_v5():
             os.environ['CUDA_VISIBLE_DEVICES'] = cuda_device
         else:
             print('running locally...')
-            os.environ["CUDA_VISIBLE_DEVICES"] = '3' # choose the device (GPU) here
+            os.environ["CUDA_VISIBLE_DEVICES"] = '1' # choose the device (GPU) here
         device = 'cuda'
     else:
         device = 'cpu'
@@ -181,7 +182,8 @@ def train_v5():
             decoder_target = decoder_target.view(-1)
             decoder_mask = decoder_mask.view(-1)
 
-            decoder_output, u_output, attn_scores, cov_scores = model(input, u_len, w_len, target)
+            decoder_output, u_output, attn_scores, cov_scores, u_attn_scores = model(input, u_len, w_len, target)
+            import pdb; pdb.set_trace()
 
             loss = criterion(decoder_output.view(-1, args['vocab_size']), decoder_target)
             loss = (loss * decoder_mask).sum() / decoder_mask.sum()
@@ -230,7 +232,7 @@ def train_v5():
                     format(str(datetime.now()), bn, num_batches, loss, loss_cov, loss_da, loss_ext))
                 sys.stdout.flush()
 
-            if bn % 5 == 0:
+            if bn % 10 == 0:
 
                 print("======================== GENERATED SUMMARY ========================")
                 print(bert_tokenizer.decode(torch.argmax(decoder_output[0], dim=-1).cpu().numpy()[:tgt_len[0]]))
@@ -249,6 +251,7 @@ def train_v5():
 
                 with torch.no_grad():
                     avg_val_loss = evaluate(model, valid_data, VAL_BATCH_SIZE, args, device, use_rouge=True)
+                    # avg_val_loss = evaluate_greedy(model, valid_data, VAL_BATCH_SIZE, args, device)
 
                 print("avg_val_loss_per_token = {}".format(avg_val_loss))
 
@@ -338,11 +341,13 @@ def evaluate(model, eval_data, eval_batch_size, args, device, use_rouge=False):
             bert_decoded_output = bert_tokenizer.decode(torch.argmax(decoder_output, dim=-1).cpu().numpy())
             stop_idx = bert_decoded_output.find('[MASK]')
             bert_decoded_output = bert_decoded_output[:stop_idx]
+            bert_decoded_output = bert_decoded_output.replace('[SEP] ', '')
             bert_decoded_outputs.append(bert_decoded_output)
 
             bert_decoded_target = bert_tokenizer.decode(decoder_target.cpu().numpy())
             stop_idx2 = bert_decoded_target.find('[MASK]')
             bert_decoded_target = bert_decoded_target[:stop_idx2]
+            bert_decoded_target = bert_decoded_target.replace('[SEP] ', '')
             bert_decoded_targets.append(bert_decoded_target)
 
         eval_idx += eval_batch_size
@@ -361,6 +366,80 @@ def evaluate(model, eval_data, eval_batch_size, args, device, use_rouge=False):
             return (scores['rouge-1']['f'] + scores['rouge-2']['f'] + scores['rouge-l']['f'])*(-100)/3
         except ValueError:
             return 0
+
+def evaluate_greedy(model, eval_data, eval_batch_size, args, device):
+    num_eval_epochs = int(len(eval_data)/eval_batch_size)
+
+    print("num_eval_epochs = {}".format(num_eval_epochs))
+    eval_idx = 0
+
+    from rouge import Rouge
+    rouge = Rouge()
+    bert_decoded_outputs = []
+    bert_decoded_targets = []
+
+    for bn in range(num_eval_epochs):
+
+        input, u_len, w_len, target, tgt_len, _, _, _ = get_a_batch(
+                eval_data, eval_idx, eval_batch_size,
+                args['num_utterances'], args['num_words'],
+                args['summary_length'], args['summary_type'], device)
+
+        # decoder target
+        decoder_target, decoder_mask = shift_decoder_target(target, tgt_len, device)
+        decoder_target = decoder_target.view(-1)
+
+        enc_output_dict = model.encoder(input, u_len, w_len) # memory
+        u_output = enc_output_dict['u_output']
+
+        # forward-pass DECODER
+        xt = torch.zeros((eval_batch_size, 1), dtype=torch.int64).to(device)
+        xt.fill_(101) # 101
+
+        # initial hidden state
+        ht = torch.zeros((model.decoder.num_layers, eval_batch_size, model.decoder.dec_hidden_size),
+                                    dtype=torch.float).to(device)
+        for bi, l in enumerate(u_len): ht[:,bi,:] = u_output[bi,l-1,:].unsqueeze(0)
+
+        decoded_words = [103 for _ in range(args['summary_length'])]
+
+        for t in range(args['summary_length']-1):
+            decoder_output, ht, _ = model.decoder.forward_step(xt, ht, enc_output_dict, logsoftmax=True)
+            next_word = decoder_output.argmax().item()
+            xt.fill_(next_word)
+            decoded_words[t] = next_word
+
+        bert_decoded_output = bert_tokenizer.decode(decoded_words)
+        stop_idx = bert_decoded_output.find('[MASK]')
+        bert_decoded_output = bert_decoded_output[:stop_idx]
+        bert_decoded_output = bert_decoded_output.replace('[SEP] ', '')
+        bert_decoded_outputs.append(bert_decoded_output)
+
+        bert_decoded_target = bert_tokenizer.decode(decoder_target.cpu().numpy())
+        stop_idx2 = bert_decoded_target.find('[MASK]')
+        bert_decoded_target = bert_decoded_target[:stop_idx2]
+        bert_decoded_target = bert_decoded_target.replace('[SEP] ', '')
+        bert_decoded_targets.append(bert_decoded_target)
+
+        eval_idx += eval_batch_size
+
+        print("#", end="")
+        sys.stdout.flush()
+
+    print()
+
+    try:
+        scores = rouge.get_scores(bert_decoded_outputs, bert_decoded_targets, avg=True)
+        print("--------------------------------------------------")
+        print("ROUGE-1 = {:.2f}".format(scores['rouge-1']['f']*100))
+        print("ROUGE-2 = {:.2f}".format(scores['rouge-2']['f']*100))
+        print("ROUGE-L = {:.2f}".format(scores['rouge-l']['f']*100))
+        print("--------------------------------------------------")
+
+        return (scores['rouge-1']['f'] + scores['rouge-2']['f'] + scores['rouge-l']['f'])*(-100)/3
+    except ValueError:
+        print("cannot compute ROUGE score")
+        return 0
 
 def adjust_lr(optimizer, lr0, decay_rate, step):
     """to adjust the learning rate for both encoder & decoder --- DECAY"""

@@ -32,7 +32,7 @@ def train_v5():
     args['num_layers_enc'] = 2    # in total it's num_layers_enc*2 (word/utt)
     args['num_layers_dec'] = 1
 
-    args['batch_size']      = 64
+    args['batch_size']      = 8
     args['update_nbatches'] = 1
     args['num_epochs']      = 20
     args['random_seed']     = 78
@@ -46,9 +46,9 @@ def train_v5():
     args['label_smoothing'] = 0.1
 
     args['model_save_dir'] = "/home/alta/summary/pm574/summariser1/lib/trained_models2/"
-    # args['load_model'] = "/home/alta/summary/pm574/summariser1/lib/trained_models/model-HGRUV2_CNNDM_JAN26A-ep3-bn0" # add .pt later
-    args['load_model'] = None
-    args['model_name'] = 'HGRUV5_CNNDM_FEB26A'
+    args['load_model'] = "/home/alta/summary/pm574/summariser1/lib/trained_models2/model-HGRUV5_CNNDM_FEB26A-ep17-bn0.pt" # add .pt later
+    # args['load_model'] = None
+    args['model_name'] = 'HGRUV5_CNNDM_APR1'
     # ---------------------------------------------------------------------------------- #
     print_config(args)
 
@@ -60,7 +60,7 @@ def train_v5():
             os.environ['CUDA_VISIBLE_DEVICES'] = cuda_device
         else:
             print('running locally...')
-            os.environ["CUDA_VISIBLE_DEVICES"] = '0,1' # choose the device (GPU) here
+            os.environ["CUDA_VISIBLE_DEVICES"] = '1' # choose the device (GPU) here
         device = 'cuda'
     else:
         device = 'cpu'
@@ -76,10 +76,29 @@ def train_v5():
     args['max_num_sentences']  = 32
     args['max_summary_length'] = args['summary_length']
     train_data = load_cnndm_data(args, 'trainx', dump=False)
+    # train_data = load_cnndm_data(args, 'test', dump=False)
+    # print("loaded TEST data")
     valid_data = load_cnndm_data(args, 'valid',  dump=False)
 
     model = EncoderDecoder(args, device=device)
     print(model)
+
+    # Load model if specified (path to pytorch .pt)
+    if args['load_model'] != None:
+        model_path = args['load_model']
+        try:
+            model.load_state_dict(torch.load(model_path))
+        except RuntimeError: # need to remove module
+            # Main model
+            model_state_dict = torch.load(model_path)
+            new_model_state_dict = OrderedDict()
+            for key in model_state_dict.keys():
+                new_model_state_dict[key.replace("module.","")] = model_state_dict[key]
+            model.load_state_dict(new_model_state_dict)
+        model.train()
+        print("Loaded model from {}".format(args['load_model']))
+    else:
+        print("Train a new model")
 
     # to use multiple GPUs
     if torch.cuda.device_count() > 1:
@@ -136,7 +155,9 @@ def train_v5():
             decoder_mask = decoder_mask.view(-1)
 
             try:
-                decoder_output = model(input, u_len, w_len, target)
+                # decoder_output = model(input, u_len, w_len, target)
+                decoder_output, _, attn_scores, _, u_attn_scores = model(input, u_len, w_len, target)
+                import pdb; pdb.set_trace()
             except IndexError:
                 print("there is an IndexError --- likely from if segment_indices[bn][-1] == u_len[bn]-1:")
                 print("for now just skip this batch!")

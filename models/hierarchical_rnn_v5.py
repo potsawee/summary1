@@ -41,11 +41,11 @@ class EncoderDecoder(nn.Module):
 
     def forward(self, input, u_len, w_len, target):
         enc_output_dict = self.encoder(input, u_len, w_len)
-        dec_output, attn_scores = self.decoder(target, enc_output_dict)
+        dec_output, attn_scores, u_attn_scores = self.decoder(target, enc_output_dict)
 
         # compute coverage
         cov_scores = self.attn2cov(attn_scores)
-        return dec_output, enc_output_dict['u_output'], attn_scores, cov_scores
+        return dec_output, enc_output_dict['u_output'], attn_scores, cov_scores, u_attn_scores
 
         # FOR multiple GPU training --- cannot have scores_uw (size error)
         # dec_output = self.decoder(target, enc_output_dict)
@@ -77,7 +77,6 @@ class EncoderDecoder(nn.Module):
                 - keypadmask_dtype = torch.bool
         """
         k                = decode_dict['k']
-        search_method    = decode_dict['search_method']
         batch_size       = decode_dict['batch_size']
         time_step        = decode_dict['time_step']
         vocab_size       = decode_dict['vocab_size']
@@ -88,158 +87,143 @@ class EncoderDecoder(nn.Module):
         penalty_ug       = decode_dict['penalty_ug']
         keypadmask_dtype = decode_dict['keypadmask_dtype']
 
+        if batch_size != 1: raise ValueError("batch size must be 1")
+
         # create beam array & scores
         beams       = [None for _ in range(k)]
-        beam_scores = np.zeros((batch_size, k))
+        beam_scores = np.zeros((k,))
 
         # we should only feed through the encoder just once!!
         enc_output_dict = self.encoder(input, u_len, w_len) # memory
         u_output = enc_output_dict['u_output']
+        w_output = enc_output_dict['w_output']
+        # w_len    = enc_output_dict['w_len']
+        enc_time_step   = w_output.size(1)
+        enc_time_step_u = u_output.size(1)
 
         # we run the decoder time_step times (auto-regressive)
-        tgt_ids = torch.zeros((batch_size, time_step), dtype=torch.int64).to(device)
-        tgt_ids[:,0] = start_token_id
+        tgt_ids = torch.zeros((time_step,), dtype=torch.int64).to(device)
+        tgt_ids[0] = start_token_id
 
         for i in range(k): beams[i] = tgt_ids
 
-        finished_beams = [[] for _ in range(batch_size)]
-
+        finished_beams = []
+        finished_beams_scores = []
+        finished_attn = []
+        finished_attn_u = []
 
         # initial hidden state
-        ht = torch.zeros((self.decoder.num_layers, batch_size, self.decoder.dec_hidden_size),
-                                    dtype=torch.float).to(self.device)
-        for bn, l in enumerate(u_len): ht[:,bn,:] = u_output[bn,l-1,:].unsqueeze(0)
+        ht = torch.zeros((self.decoder.num_layers, 1, self.decoder.dec_hidden_size), dtype=torch.float).to(self.device)
+        l = u_len[0]
+        ht[:,0,:] = u_output[0,l-1,:].unsqueeze(0)
+
         beam_ht = [None for _ in range(k)]
         for _k in range(k): beam_ht[_k] = ht.clone()
 
         finish = False
+
+        attn_scores_array = [torch.zeros((time_step, enc_time_step)) for _ in range(k)]
+        attn_scores_u_array = [torch.zeros((time_step, enc_time_step_u)) for _ in range(k)]
+
         for t in range(time_step-1):
             if finish: break
-            decoder_output_t_array = torch.zeros((batch_size, k*vocab_size))
+
+            decoder_output_t_array = torch.zeros((k*vocab_size,))
 
             for i, beam in enumerate(beams):
 
                 # inference decoding
-                decoder_output, beam_ht[i], attn_scores = self.decoder.forward_step(beam[:,t:t+1], beam_ht[i], enc_output_dict, logsoftmax=True)
-
-                # print("t = {}: attn_scores = {}".format(t , attn_scores))
-                # import pdb; pdb.set_trace()
+                decoder_output, beam_ht[i], attn_scores, attn_scores_u = self.decoder.forward_step(beam[t:t+1].unsqueeze(0), beam_ht[i], enc_output_dict, logsoftmax=True)
+                attn_scores_array[i][t, :] = attn_scores[0,0,:]
+                attn_scores_u_array[i][t, :] = attn_scores_u[0,0,:]
 
                 # check if there is STOP_TOKEN emitted in the previous time step already
                 # i.e. if the input at this time step is STOP_TOKEN
-                for n_idx in range(batch_size):
-                    if beam[n_idx][t] == stop_token_id: # already stop
-                        decoder_output[n_idx, :] = float('-inf')
-                        decoder_output[n_idx, stop_token_id] = 0.0 # to ensure STOP_TOKEN will be picked again!
+                if beam[t] == stop_token_id: # already stop
+                    decoder_output[0, :] = float('-inf')
+                    decoder_output[0, stop_token_id] = 0.0 # to ensure STOP_TOKEN will be picked again!
 
-                decoder_output_t_array[:,i*vocab_size:(i+1)*vocab_size] = decoder_output
+                decoder_output_t_array[i*vocab_size:(i+1)*vocab_size] = decoder_output[0]
 
                 # add previous beam score bias
-                for n_idx in range(batch_size):
-                    decoder_output_t_array[n_idx,i*vocab_size:(i+1)*vocab_size] += beam_scores[n_idx,i]
+                decoder_output_t_array[i*vocab_size:(i+1)*vocab_size] += beam_scores[i]
 
-                    if search_method == 'argmax':
-                        # Penalty term for repeated uni-gram
-                        unigram_dict = {}
-                        for tt in range(t+1):
-                            v = beam[n_idx,tt].cpu().numpy().item()
-                            if v not in unigram_dict: unigram_dict[v] = 1
-                            else: unigram_dict[v] += 1
-                        for vocab_id, vocab_count in unigram_dict.items():
-                            decoder_output_t_array[n_idx,(i*vocab_size)+vocab_id] -= penalty_ug*vocab_count/(t+1)
+                if penalty_ug > 0.0:
+                    # Penalty term for repeated uni-gram
+                    unigram_dict = {}
+                    for tt in range(t+1):
+                        v = beam[tt].cpu().numpy().item()
+                        if v not in unigram_dict: unigram_dict[v] = 1
+                        else: unigram_dict[v] += 1
+                    for vocab_id, vocab_count in unigram_dict.items():
+                        decoder_output_t_array[(i*vocab_size)+vocab_id] -= penalty_ug*vocab_count/(t+1)
 
                 # only support batch_size = 1!
                 if t == 0:
-                    decoder_output_t_array[n_idx,(i+1)*vocab_size:] = float('-inf')
+                    decoder_output_t_array[(i+1)*vocab_size:] = float('-inf')
                     break
 
-            if search_method == 'sampling':
-                # Sampling
-                scores  = np.zeros((batch_size, k))
-                indices = np.zeros((batch_size, k))
-                pmf = np.exp(decoder_output_t_array.cpu().numpy())
-                for bi in range(batch_size):
-                    if pmf[bi].sum() != 1.0:
-                        pmf[bi] /= pmf[bi].sum()
-                    sampled_ids = np.random.choice(k*vocab_size, size=k, p=pmf[bi])
-                    for _s, s_id in enumerate(sampled_ids):
-                        scores[bi, _s]  = decoder_output_t_array[bi, s_id]
-                        indices[bi, _s] = s_id
 
-            elif search_method == 'argmax':
-                # Argmax
-                topk_scores, topk_ids = torch.topk(decoder_output_t_array, k, dim=-1)
-                scores = topk_scores.double().cpu().numpy()
-                indices = topk_ids.double().cpu().numpy()
+            # Argmax
+            topk_scores, topk_ids = torch.topk(decoder_output_t_array, k, dim=-1)
+            scores = topk_scores.double().cpu().numpy()
+            indices = topk_ids.double().cpu().numpy()
 
-            new_beams = [torch.zeros((batch_size, time_step), dtype=torch.int64).to(device) for _ in range(k)]
-            for r_idx, row in enumerate(indices):
-                for c_idx, node in enumerate(row):
-                    vocab_idx = node % vocab_size
-                    beam_idx  = int(node / vocab_size)
+            new_beams = [torch.zeros((time_step,), dtype=torch.int64).to(device) for _ in range(k)]
+            new_attn_scores_array = [torch.zeros((time_step, enc_time_step)) for _ in range(k)]
+            new_attn_scores_u_array = [torch.zeros((time_step, enc_time_step_u)) for _ in range(k)]
 
-                    new_beams[c_idx][r_idx,:t+1] = beams[beam_idx][r_idx,:t+1]
-                    new_beams[c_idx][r_idx,t+1]  = vocab_idx
 
-                    # if there is a beam that has [END_TOKEN] --- store it
-                    if vocab_idx == stop_token_id:
-                        finished_beams[r_idx].append(new_beams[c_idx][r_idx,:t+1+1])
-                        scores[r_idx, c_idx] = float('-inf')
+            for c_idx, node in enumerate(indices):
 
-            # only support BATCH SIZE = 1
-            count_stop = 0
-            for ik in range(k):
-                if scores[0,ik] == float('-inf'): count_stop += 1
-            if count_stop == k: finish = True
+                vocab_idx = node % vocab_size
+                beam_idx  = int(node / vocab_size)
+
+                new_beams[c_idx][:t+1] = beams[beam_idx][:t+1]
+                new_beams[c_idx][t+1]  = vocab_idx
+
+                new_attn_scores_array[c_idx][:t+1 ,:] = attn_scores_array[beam_idx][:t+1 ,:]
+                new_attn_scores_u_array[c_idx][:t+1 ,:] = attn_scores_u_array[beam_idx][:t+1 ,:]
+
+                # if there is a beam that has [END_TOKEN] --- store it
+                if vocab_idx == stop_token_id:
+                    finished_beams.append(new_beams[c_idx][:t+1+1])
+                    finished_beams_scores.append(scores[c_idx] / t**alpha)
+                    finished_attn.append(new_attn_scores_array[c_idx][:t+1 ,:])
+                    finished_attn_u.append(new_attn_scores_u_array[c_idx][:t+1 ,:])
+                    # print("beam{}: [{:.5f}]".format(c_idx, scores[c_idx] / t**alpha), bert_tokenizer.decode(new_beams[c_idx][:t+1+1].cpu().numpy()))
+                    scores[c_idx] = float('-inf')
 
             beams = new_beams
-            if search_method == 'sampling':
-                # normalisation the score
-                scores = np.exp(scores)
-                scores = scores / scores.sum(axis=-1).reshape(batch_size, 1)
-                beam_scores = np.log(scores + 1e-20) # suppress warning log(zero)
-            elif search_method == 'argmax':
-                beam_scores = scores
+            attn_scores_array = new_attn_scores_array
+            attn_scores_u_array = new_attn_scores_u_array
+            beam_scores = scores
 
             # print("=========================  t = {} =========================".format(t))
             # for ik in range(k):
-            #     print("beam{}: [{:.5f}]".format(ik, scores[0,ik]),bert_tokenizer.decode(beams[ik][0].cpu().numpy()[:t+2]))
+            #     print("beam{}: [{:.5f}]".format(ik, scores[ik]),bert_tokenizer.decode(beams[ik].cpu().numpy()[:t+2]))
             # import pdb; pdb.set_trace()
 
-            if (t % 50) == 0:
-                print("{}=".format(t), end="")
-                sys.stdout.flush()
-        print("{}=#".format(t))
+        #     if (t % 10) == 0:
+        #         print("{}=".format(t), end="")
+        #         sys.stdout.flush()
+        # print("{}=#".format(t))
 
-        for bi in range(batch_size):
-            if len(finished_beams[bi]) == 0:
-                finished_beams[bi].append(beams[0][bi])
+        # import pdb; pdb.set_trace()
+        if len(finished_beams_scores) > 0:
+            max_id = finished_beams_scores.index(max(finished_beams_scores))
+            summary_ids = finished_beams[max_id]
+            attn_score  = finished_attn[max_id]
+            attn_score_u  = finished_attn_u[max_id]
+        else:
+            summary_ids = beams[0]
+            attn_score  = attn_scores_array[0]
+            attn_score_u = attn_scores_u_array[0]
+        # print(bert_tokenizer.decode(summary_ids.cpu().numpy()))
 
-        summaries_id = [None for _ in range(batch_size)]
-        # for j in range(batch_size): summaries_id[j] = beams[0][j].cpu().numpy()
-        for j in range(batch_size):
-            _scores = self.beam_scoring(finished_beams[j], enc_output_dict, alpha)
-            summaries_id[j] = finished_beams[j][np.argmax(_scores)].cpu().numpy()
-            print(bert_tokenizer.decode(summaries_id[j]))
+        return summary_ids, attn_score, attn_score_u
 
-        return summaries_id
 
-    def beam_scoring(self, beams, enc_output_dict, alpha):
-        # scores ===> same shape as the beams
-        # beams  ===> batch_size = 1
-        scores = [None for _ in range(len(beams))]
-        for i, seq in enumerate(beams):
-            timesteps = seq.size(0)
-            decoder_output, _ = self.decoder(seq.view(1, timesteps), enc_output_dict, logsoftmax=True)
-
-            score = 0
-            for t in range(timesteps-1):
-                pred_t  = seq[t+1]
-                score_t = decoder_output[0, t, pred_t]
-                score  += score_t
-            scores[i] = score.cpu().numpy().item() / (timesteps)**alpha
-            # print("SCORING: beam{}: score={:2f} --- len={} --- norm_score={}".format(i,score.cpu().numpy().item(), timesteps, scores[i]))
-        return scores
 
 class HierarchicalGRU(nn.Module):
     def __init__(self, vocab_size, embedding_dim, rnn_hidden_size, num_layers, dropout, device):
@@ -303,12 +287,10 @@ class HierarchicalGRU(nn.Module):
                 w2_output[bn, x:x+l2, :] = w_output[bn, j, :l2, :]
                 x += l2.item()
                 utt_indices[bn].append(x-1) # minus one!!
-
         encoder_output_dict = {
             'u_output': utt_output, 'u_len': u_len,
             'w_output': w2_output, 'w_len': w2_len, 'utt_indices': utt_indices
         }
-
         return encoder_output_dict
 
 class DecoderGRU(nn.Module):
@@ -386,10 +368,10 @@ class DecoderGRU(nn.Module):
         if logsoftmax:
             dec_output = self.logsoftmax(dec_output)
 
-        return dec_output, scores_uw
+        return dec_output, scores_uw, torch.exp(scores_u)
 
         # FOR multiple GPU training --- cannot have scores_uw (size error)
-        return dec_output
+        # return dec_output
 
     def forward_step(self, xt, ht, encoder_output_dict, logsoftmax=True):
         u_output = encoder_output_dict['u_output']
@@ -440,14 +422,7 @@ class DecoderGRU(nn.Module):
         if logsoftmax:
             dec_output = self.logsoftmax(dec_output)
 
-        return dec_output[:,-1,:], ht1, scores_uw
-
-    def init_h0(self, batch_size):
-        # h0 = torch.zeros((batch_size, self.num_layers, self.dec_hidden_size)).to(self.device)
-        # swap dim 0,1 on 21 January 2020
-        h0 = torch.zeros((self.num_layers, batch_size, self.dec_hidden_size)).to(self.device)
-
-        return h0
+        return dec_output[:,-1,:], ht1, scores_uw, torch.exp(scores_u)
 
 class DALabeller(nn.Module):
     def __init__(self, rnn_hidden_size, num_da_acts, device):
