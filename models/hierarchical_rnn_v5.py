@@ -18,7 +18,8 @@ class EncoderDecoder(nn.Module):
 
         # Decoder - GRU with attention mechanism
         self.decoder = DecoderGRU(args['vocab_size'], args['embedding_dim'], args['rnn_hidden_size'], args['rnn_hidden_size'],
-                                       num_layers=args['num_layers_dec'], dropout=args['dropout'], device=device)
+                                       num_layers=args['num_layers_dec'], dropout=args['dropout'],
+                                       memory_utt=args['memory_utt'], device=device)
 
         self.param_init()
 
@@ -86,6 +87,7 @@ class EncoderDecoder(nn.Module):
         alpha            = decode_dict['alpha']
         penalty_ug       = decode_dict['penalty_ug']
         keypadmask_dtype = decode_dict['keypadmask_dtype']
+        memory_utt       = decode_dict['memory_utt']
 
         if batch_size != 1: raise ValueError("batch size must be 1")
 
@@ -120,6 +122,11 @@ class EncoderDecoder(nn.Module):
         beam_ht = [None for _ in range(k)]
         for _k in range(k): beam_ht[_k] = ht.clone()
 
+        if memory_utt:
+            beam_dt = [torch.zeros((batch_size, vocab_size), dtype=torch.float).to(self.device) for _ in range(k)]
+            beam_eu = [torch.zeros((batch_size, 1, u_output.size(1)), dtype=torch.float).to(self.device) for _ in range(k)]
+
+
         finish = False
 
         attn_scores_array = [torch.zeros((time_step, enc_time_step)) for _ in range(k)]
@@ -133,10 +140,17 @@ class EncoderDecoder(nn.Module):
             for i, beam in enumerate(beams):
 
                 # inference decoding
-                decoder_output, beam_ht[i], attn_scores, attn_scores_u = self.decoder.forward_step(beam[t:t+1].unsqueeze(0), beam_ht[i], enc_output_dict, logsoftmax=True)
+                if memory_utt:
+                    decoder_output, beam_ht[i], attn_scores, attn_scores_u, _ = self.decoder.forward_step(beam[t:t+1].unsqueeze(0), beam_ht[i], enc_output_dict,
+                                                                                                    d_prev=beam_dt[i], eu_prev=beam_eu[i], logsoftmax=True)
+                    beam_dt[i] = decoder_output
+                    beam_eu[i] = attn_scores_u
+
+                else:
+                    decoder_output, beam_ht[i], attn_scores, attn_scores_u, _ = self.decoder.forward_step(beam[t:t+1].unsqueeze(0), beam_ht[i], enc_output_dict, logsoftmax=True)
+
                 attn_scores_array[i][t, :] = attn_scores[0,0,:]
                 attn_scores_u_array[i][t, :] = attn_scores_u[0,0,:]
-
                 # check if there is STOP_TOKEN emitted in the previous time step already
                 # i.e. if the input at this time step is STOP_TOKEN
                 if beam[t] == stop_token_id: # already stop
@@ -172,7 +186,11 @@ class EncoderDecoder(nn.Module):
             new_beams = [torch.zeros((time_step,), dtype=torch.int64).to(device) for _ in range(k)]
             new_attn_scores_array = [torch.zeros((time_step, enc_time_step)) for _ in range(k)]
             new_attn_scores_u_array = [torch.zeros((time_step, enc_time_step_u)) for _ in range(k)]
+            new_beam_ht = [None for _ in range(k)]
 
+            if memory_utt:
+                new_beam_dt = [None for _ in range(k)]
+                new_beam_eu = [None for _ in range(k)]
 
             for c_idx, node in enumerate(indices):
 
@@ -181,6 +199,11 @@ class EncoderDecoder(nn.Module):
 
                 new_beams[c_idx][:t+1] = beams[beam_idx][:t+1]
                 new_beams[c_idx][t+1]  = vocab_idx
+
+                new_beam_ht[c_idx]     = beam_ht[beam_idx]
+                if memory_utt:
+                    new_beam_dt[c_idx] = beam_dt[beam_idx]
+                    new_beam_eu[c_idx] = beam_eu[beam_idx]
 
                 new_attn_scores_array[c_idx][:t+1 ,:] = attn_scores_array[beam_idx][:t+1 ,:]
                 new_attn_scores_u_array[c_idx][:t+1 ,:] = attn_scores_u_array[beam_idx][:t+1 ,:]
@@ -195,6 +218,10 @@ class EncoderDecoder(nn.Module):
                     scores[c_idx] = float('-inf')
 
             beams = new_beams
+            beam_ht = new_beam_ht
+            if memory_utt:
+                beam_dt = new_beam_dt
+                beam_eu = new_beam_eu
             attn_scores_array = new_attn_scores_array
             attn_scores_u_array = new_attn_scores_u_array
             beam_scores = scores
@@ -204,19 +231,18 @@ class EncoderDecoder(nn.Module):
             #     print("beam{}: [{:.5f}]".format(ik, scores[ik]),bert_tokenizer.decode(beams[ik].cpu().numpy()[:t+2]))
             # import pdb; pdb.set_trace()
 
-        #     if (t % 10) == 0:
-        #         print("{}=".format(t), end="")
-        #         sys.stdout.flush()
-        # print("{}=#".format(t))
+            if (t % 10) == 0:
+                print("{}=".format(t), end="")
+                sys.stdout.flush()
+        print("{}=#".format(t))
 
-        # import pdb; pdb.set_trace()
         if len(finished_beams_scores) > 0:
             max_id = finished_beams_scores.index(max(finished_beams_scores))
-            summary_ids = finished_beams[max_id]
+            summary_ids = finished_beams[max_id].cpu().numpy()
             attn_score  = finished_attn[max_id]
             attn_score_u  = finished_attn_u[max_id]
         else:
-            summary_ids = beams[0]
+            summary_ids = beams[0].cpu().numpy()
             attn_score  = attn_scores_array[0]
             attn_score_u = attn_scores_u_array[0]
         # print(bert_tokenizer.decode(summary_ids.cpu().numpy()))
@@ -296,7 +322,8 @@ class HierarchicalGRU(nn.Module):
 class DecoderGRU(nn.Module):
     """A conditional RNN decoder with attention."""
 
-    def __init__(self, vocab_size, embedding_dim, dec_hidden_size, mem_hidden_size, num_layers, dropout, device):
+    def __init__(self, vocab_size, embedding_dim, dec_hidden_size, mem_hidden_size,
+                num_layers, dropout, memory_utt, device):
         super(DecoderGRU, self).__init__()
         self.device      = device
         self.vocab_size  = vocab_size
@@ -304,6 +331,7 @@ class DecoderGRU(nn.Module):
         self.mem_hidden_size = mem_hidden_size
         self.num_layers  = num_layers
         self.dropout     = dropout
+        self.memory_utt  = memory_utt
 
         self.embedding = nn.Embedding(vocab_size, embedding_dim=embedding_dim, padding_idx=0)
 
@@ -316,6 +344,14 @@ class DecoderGRU(nn.Module):
 
         self.output_layer = nn.Linear(dec_hidden_size+mem_hidden_size, vocab_size, bias=True)
         self.logsoftmax = nn.LogSoftmax(dim=-1)
+
+        if memory_utt:
+            self.mem_utt_d = nn.Linear(vocab_size, 1, bias=False)
+            self.mem_utt_y = nn.Linear(embedding_dim, 1, bias=False)
+            self.mem_utt_s = nn.Linear(dec_hidden_size, 1, bias=True)
+            self.utt_d_lnorm = nn.LayerNorm(vocab_size)
+            self.utt_y_lnorm = nn.LayerNorm(embedding_dim)
+            self.utt_s_lnorm = nn.LayerNorm(dec_hidden_size)
 
     def forward(self, target, encoder_output_dict, logsoftmax=True):
         u_output = encoder_output_dict['u_output']
@@ -332,48 +368,70 @@ class DecoderGRU(nn.Module):
         initial_h = torch.zeros((self.num_layers, batch_size, self.dec_hidden_size), dtype=torch.float).to(self.device)
         for bn, l in enumerate(u_len):
             initial_h[:,bn,:] = u_output[bn,l-1,:].unsqueeze(0)
-        self.rnn.flatten_parameters()
-        rnn_output, _ = self.rnn(embed, initial_h)
 
-        # attention mechanism LEVEL --- Utterance (u)
-        scores_u = torch.bmm(rnn_output, self.attention_u(u_output).permute(0,2,1))
-        for bn, l in enumerate(u_len):
-            scores_u[bn,:,l:].fill_(float('-inf'))
-        scores_u = F.log_softmax(scores_u, dim=-1)
+        if not self.memory_utt:
+            self.rnn.flatten_parameters()
+            rnn_output, _ = self.rnn(embed, initial_h)
 
-        # attention mechanism LEVEL --- Word (w)
-        scores_w = torch.bmm(rnn_output, self.attention_w(w_output).permute(0,2,1))
-        for bn, l in enumerate(w_len):
-            scores_w[bn,:,l:].fill_(float('-inf'))
-        # scores_w = F.log_softmax(scores_w, dim=-1)
-        scores_uw = torch.zeros(scores_w.shape).to(self.device)
-        scores_uw.fill_(float('-inf')) # when doing log-addition
+            # attention mechanism LEVEL --- Utterance (u)
+            scores_u = torch.bmm(rnn_output, self.attention_u(u_output).permute(0,2,1))
+            for bn, l in enumerate(u_len):
+                scores_u[bn,:,l:].fill_(float('-inf'))
+            scores_u = F.log_softmax(scores_u, dim=-1)
 
-        # Utterance -> Word
-        for bn in range(batch_size):
-            idx1 = 0
-            idx2 = 0
-            end_indices = utt_indices[bn]
-            start_indices = [0] + [a+1 for a in end_indices[:-1]]
-            for i in range(len(utt_indices[bn])):
-                i1 = start_indices[i]
-                i2 = end_indices[i]+1 # python
-                scores_uw[bn, :, i1:i2] = scores_u[bn, :, i].unsqueeze(-1) + F.log_softmax(scores_w[bn, :, i1:i2], dim=-1)
+            # attention mechanism LEVEL --- Word (w)
+            scores_w = torch.bmm(rnn_output, self.attention_w(w_output).permute(0,2,1))
+            for bn, l in enumerate(w_len):
+                scores_w[bn,:,l:].fill_(float('-inf'))
+            # scores_w = F.log_softmax(scores_w, dim=-1)
+            scores_uw = torch.zeros(scores_w.shape).to(self.device)
+            scores_uw.fill_(float('-inf')) # when doing log-addition
 
-        scores_uw = torch.exp(scores_uw)
-        context_vec = torch.bmm(scores_uw, w_output)
+            # Utterance -> Word
+            for bn in range(batch_size):
+                idx1 = 0
+                idx2 = 0
+                end_indices = utt_indices[bn]
+                start_indices = [0] + [a+1 for a in end_indices[:-1]]
+                for i in range(len(utt_indices[bn])):
+                    i1 = start_indices[i]
+                    i2 = end_indices[i]+1 # python
+                    scores_uw[bn, :, i1:i2] = scores_u[bn, :, i].unsqueeze(-1) + F.log_softmax(scores_w[bn, :, i1:i2], dim=-1)
 
-        dec_output = self.output_layer(torch.cat((context_vec, rnn_output), dim=-1))
+            scores_uw = torch.exp(scores_uw)
+            context_vec = torch.bmm(scores_uw, w_output)
 
-        if logsoftmax:
-            dec_output = self.logsoftmax(dec_output)
+            dec_output = self.output_layer(torch.cat((context_vec, rnn_output), dim=-1))
 
-        return dec_output, scores_uw, torch.exp(scores_u)
+            if logsoftmax:
+                dec_output = self.logsoftmax(dec_output)
 
-        # FOR multiple GPU training --- cannot have scores_uw (size error)
-        # return dec_output
+            return dec_output, scores_uw, torch.exp(scores_u)
 
-    def forward_step(self, xt, ht, encoder_output_dict, logsoftmax=True):
+            # FOR multiple GPU training --- cannot have scores_uw (size error)
+            # return dec_output
+
+        else:
+            target_len = target.size(1)
+            ht = initial_h
+            scores_u  = torch.zeros((batch_size, target_len, u_output.size(1)), dtype=torch.float).to(self.device)
+            scores_uw = torch.zeros((batch_size, target_len, w_output.size(1)), dtype=torch.float).to(self.device)
+            dec_output = torch.zeros((batch_size, target_len, self.vocab_size), dtype=torch.float).to(self.device)
+
+            for t in range(target_len):
+                if t == 0:
+                    zero_attn_u = torch.zeros((batch_size, 1, u_output.size(1)), dtype=torch.float).to(self.device)
+                    dt = torch.zeros((batch_size, self.vocab_size), dtype=torch.float).to(self.device)
+                    output, ht, score_uw, score_u, dt = self.forward_step(target[:,t].unsqueeze(-1), ht, encoder_output_dict, dt, zero_attn_u, logsoftmax=True)
+                else:
+                    output, ht, score_uw, score_u, dt = self.forward_step(target[:,t].unsqueeze(-1), ht, encoder_output_dict, dt, score_u, logsoftmax=True)
+
+                dec_output[:,t,:] = output
+                scores_uw[:,t,:] = score_uw[:,0,:]
+                scores_u[:,t,:]  = score_u[:,0,:]
+            return dec_output, scores_uw, scores_u
+
+    def forward_step(self, xt, ht, encoder_output_dict, d_prev=None, eu_prev=None, logsoftmax=True):
         u_output = encoder_output_dict['u_output']
         u_len    = encoder_output_dict['u_len']
         w_output = encoder_output_dict['w_output']
@@ -392,7 +450,24 @@ class DecoderGRU(nn.Module):
         scores_u = torch.bmm(rnn_output, self.attention_u(u_output).permute(0,2,1))
         for bn, l in enumerate(u_len):
             scores_u[bn,:,l:].fill_(float('-inf'))
-        scores_u = F.log_softmax(scores_u, dim=-1)
+        # scores_u = F.log_softmax(scores_u, dim=-1)
+        scores_u = F.softmax(scores_u, dim=-1)
+
+        if self.memory_utt:
+            # layer normalisation
+            d_prev = self.utt_d_lnorm(d_prev)
+            x_cur  = self.utt_y_lnorm(xt.squeeze(1))
+            s_cur  = self.utt_s_lnorm(rnn_output.squeeze(1))
+
+            # compute gamma
+            gamma = self.mem_utt_d(d_prev) + self.mem_utt_y(x_cur) + self.mem_utt_s(s_cur)
+            # print("gamm1:", gamma)
+            gamma = torch.sigmoid(gamma).unsqueeze(-1)
+            # print("gamm2:", gamma)
+            # import pdb; pdb.set_trace()
+            scores_u = (1-gamma)*scores_u + gamma*eu_prev
+            scores_u = scores_u / scores_u.sum(dim=-1, keepdim=True) # when t == 0 --- we need to normalise
+
 
         # attention mechanism LEVEL --- Word (w)
         scores_w = torch.bmm(rnn_output, self.attention_w(w_output).permute(0,2,1))
@@ -400,7 +475,6 @@ class DecoderGRU(nn.Module):
             scores_w[bn,:,l:].fill_(float('-inf'))
         scores_uw = torch.zeros(scores_w.shape).to(self.device)
         scores_uw.fill_(float('-inf')) # when doing log-addition
-
 
         # Utterance -> Word
         for bn in range(batch_size):
@@ -411,19 +485,20 @@ class DecoderGRU(nn.Module):
             for i in range(len(utt_indices[bn])):
                 i1 = start_indices[i]
                 i2 = end_indices[i]+1 # python
-                scores_uw[bn, :, i1:i2] = scores_u[bn, :, i].unsqueeze(-1) + F.log_softmax(scores_w[bn, :, i1:i2], dim=-1)
+                scores_uw[bn, :, i1:i2] = scores_u[bn, :, i].unsqueeze(-1) * F.softmax(scores_w[bn, :, i1:i2], dim=-1)
 
-        scores_uw = torch.exp(scores_uw)
+
+        # scores_uw = torch.exp(scores_uw)
         context_vec = torch.bmm(scores_uw, w_output)
-
         dec_output = self.output_layer(torch.cat((context_vec, rnn_output), dim=-1))
 
 
         if logsoftmax:
-            dec_output = self.logsoftmax(dec_output)
+            logsm_dec_output = self.logsoftmax(dec_output)
+            return logsm_dec_output[:,-1,:], ht1, scores_uw, scores_u, dec_output[:,-1,:]
 
-        return dec_output[:,-1,:], ht1, scores_uw, torch.exp(scores_u)
-
+        else:
+            return dec_output[:,-1,:], ht1, scores_uw, scores_u, dec_output[:,-1,:]
 class DALabeller(nn.Module):
     def __init__(self, rnn_hidden_size, num_da_acts, device):
         super(DALabeller, self).__init__()

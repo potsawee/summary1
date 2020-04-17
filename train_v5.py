@@ -34,11 +34,11 @@ def train_v5():
 
     args['batch_size']      = 1
     args['update_nbatches'] = 2
-    args['num_epochs']      = 30
-    args['random_seed']     = 78
+    args['num_epochs']      = 20
+    args['random_seed']     = 777
     args['best_val_loss']     = 1e+10
     args['val_batch_size']    = 1 # 1 for now --- evaluate ROUGE
-    args['val_stop_training'] = 30
+    args['val_stop_training'] = 5
 
     args['lr']         = 1.0
     args['adjust_lr']  = True     # if True overwrite the learning rate above
@@ -46,15 +46,19 @@ def train_v5():
     args['decay_rate'] = 0.5
     args['label_smoothing'] = 0.1
 
-    args['a_da']  = 0.0
-    args['a_ext'] = 0.0
+    args['a_da']  = 0.2
+    args['a_ext'] = 0.2
     args['a_cov'] = 0.0
+    args['a_div'] = 1.0
+
+    args['memory_utt'] = False
 
     args['model_save_dir'] = "/home/alta/summary/pm574/summariser1/lib/trained_models2/"
-    # args['load_model'] = "/home/alta/summary/pm574/summariser1/lib/trained_models2/model-HGRUV5_CNNDM_FEB26A-ep12-bn0" # add .pt later
-    args['load_model'] = "/home/alta/summary/pm574/summariser1/lib/trained_models2/model-HGRUV5_FEB28A-ep6"
+    args['load_model'] = "/home/alta/summary/pm574/summariser1/lib/trained_models2/model-HGRUV5_CNNDM_FEB26A-ep12-bn0" # add .pt later
+    # args['load_model'] = "/home/alta/summary/pm574/summariser1/lib/trained_models2/model-HGRUV5_FEB28A-ep6"
+    # args['load_model'] = "/home/alta/summary/pm574/summariser1/lib/trained_models2/model-HGRUV5MEM_APR8A-ep1"
     # args['load_model'] = None
-    args['model_name'] = 'HGRUV5_MARCH3X'
+    args['model_name'] = 'HGRUV5_APR16H5'
     # ---------------------------------------------------------------------------------- #
     print_config(args)
 
@@ -66,7 +70,7 @@ def train_v5():
             os.environ['CUDA_VISIBLE_DEVICES'] = cuda_device
         else:
             print('running locally...')
-            os.environ["CUDA_VISIBLE_DEVICES"] = '1' # choose the device (GPU) here
+            os.environ["CUDA_VISIBLE_DEVICES"] = '0' # choose the device (GPU) here
         device = 'cuda'
     else:
         device = 'cpu'
@@ -80,9 +84,9 @@ def train_v5():
     train_data = load_ami_data('train')
     valid_data = load_ami_data('valid')
     # make the training data 100
-    # random.shuffle(valid_data)
-    # train_data.extend(valid_data[:6])
-    # valid_data = valid_data[6:]
+    random.shuffle(valid_data)
+    train_data.extend(valid_data[:6])
+    valid_data = valid_data[6:]
 
     model = EncoderDecoder(args, device=device)
     print(model)
@@ -92,36 +96,28 @@ def train_v5():
     ext_labeller = EXTLabeller(args['rnn_hidden_size'], device)
     print(ext_labeller)
 
-    # to use multiple GPUs
-    if torch.cuda.device_count() > 1:
-        print("Multiple GPUs: {}".format(torch.cuda.device_count()))
-        model = nn.DataParallel(model)
-        da_labeller = nn.DataParallel(da_labeller)
-        ext_labeller = nn.DataParallel(ext_labeller)
-
     # Load model if specified (path to pytorch .pt)
     if args['load_model'] != None:
         model_path = args['load_model'] + '.pt'
-        da_path = args['load_model'] + '.da.pt'
-        ext_path = args['load_model'] + '.ext.pt'
         try:
             model.load_state_dict(torch.load(model_path))
-            # da_labeller.load_state_dict(torch.load(da_path))
-            # ext_labeller.load_state_dict(torch.load(ext_path))
         except RuntimeError: # need to remove module
             # Main model
             model_state_dict = torch.load(model_path)
             new_model_state_dict = OrderedDict()
             for key in model_state_dict.keys():
                 new_model_state_dict[key.replace("module.","")] = model_state_dict[key]
-            model.load_state_dict(new_model_state_dict)
+
+            if args['memory_utt']:
+                model.load_state_dict(new_model_state_dict, strict=False)
+            else:
+                model.load_state_dict(new_model_state_dict)
 
         model.train()
-        da_labeller.train()
-        ext_labeller.train()
         print("Loaded model from {}".format(args['load_model']))
     else:
         print("Train a new model")
+
 
     # Hyperparameters
     BATCH_SIZE = args['batch_size']
@@ -135,11 +131,18 @@ def train_v5():
     else:
         criterion = nn.NLLLoss(reduction='none')
 
-    topic_segment_criterion = nn.BCELoss(reduction='none')
     da_criterion = nn.NLLLoss(reduction='none')
     ext_criterion = nn.BCELoss(reduction='none')
 
-    # we use two separate optimisers (encoder & decoder)
+    # ONLY train the momory part #
+    # for name, param in model.named_parameters():
+    #     if "utt" in name:
+    #         pass
+    #     else:
+    #         param.requires_grad = False
+    # optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()),lr=args['lr'],betas=(0.9,0.999),eps=1e-08,weight_decay=0)
+    # -------------------------- #
+
     optimizer = optim.Adam(model.parameters(),lr=args['lr'],betas=(0.9,0.999),eps=1e-08,weight_decay=0)
     optimizer.zero_grad()
 
@@ -183,14 +186,21 @@ def train_v5():
             decoder_mask = decoder_mask.view(-1)
 
             decoder_output, u_output, attn_scores, cov_scores, u_attn_scores = model(input, u_len, w_len, target)
-            import pdb; pdb.set_trace()
 
             loss = criterion(decoder_output.view(-1, args['vocab_size']), decoder_target)
             loss = (loss * decoder_mask).sum() / decoder_mask.sum()
 
             # COVLOSS:
-            loss_cov = compute_covloss(attn_scores, cov_scores)
-            loss_cov = (loss_cov.view(-1) * decoder_mask).sum() / decoder_mask.sum()
+            # loss_cov = compute_covloss(attn_scores, cov_scores)
+            # loss_cov = (loss_cov.view(-1) * decoder_mask).sum() / decoder_mask.sum()
+
+            # Diversity Loss (4):
+            intra_div, inter_div = diverisity_loss(u_attn_scores, decoder_target, u_len, tgt_len)
+            if inter_div == 0:
+                loss_div = 0
+            else:
+                loss_div = intra_div/inter_div
+
 
             # multitask(2): dialogue act prediction
             da_output = da_labeller(u_output)
@@ -203,8 +213,13 @@ def train_v5():
             loss_ext = ext_criterion(ext_output, extractive_label)
             loss_ext = (loss_ext * loss_utt_mask).sum() / loss_utt_mask.sum()
 
-            total_loss = loss + args['a_da']*loss_da + args['a_ext']*loss_ext + args['a_cov']*loss_cov
+            # total_loss = loss + args['a_da']*loss_da + args['a_ext']*loss_ext + args['a_cov']*loss_cov
+            total_loss = loss + args['a_da']*loss_da + args['a_ext']*loss_ext + args['a_div']*loss_div
+            # total_loss = loss + args['a_da']*loss_da + args['a_ext']*loss_ext
+            # total_loss = loss + args['a_div']*loss_div
+
             total_loss.backward()
+            # loss.backward()
 
             idx += BATCH_SIZE
 
@@ -228,8 +243,13 @@ def train_v5():
                 training_step += args['batch_size']*args['update_nbatches']
 
             if bn % 1 == 0:
-                print("[{}] batch {}/{}: loss = {:.5f} | loss_cov = {:.5f} | loss_da = {:.5f} | loss_ext = {:.5f}".
-                    format(str(datetime.now()), bn, num_batches, loss, loss_cov, loss_da, loss_ext))
+                print("[{}] batch {}/{}: loss = {:.5f} | loss_div = {:.5f} | loss_da = {:.5f} | loss_ext = {:.5f}".
+                    format(str(datetime.now()), bn, num_batches, loss, loss_div, loss_da, loss_ext))
+                # print("[{}] batch {}/{}: loss = {:.5f} | loss_da = {:.5f} | loss_ext = {:.5f}".
+                #     format(str(datetime.now()), bn, num_batches, loss, loss_da, loss_ext))
+                # print("[{}] batch {}/{}: loss = {:.5f} | loss_div = {:.5f}".
+                    # format(str(datetime.now()), bn, num_batches, loss, loss_div))
+                # print("[{}] batch {}/{}: loss = {:.5f}".format(str(datetime.now()), bn, num_batches, loss))
                 sys.stdout.flush()
 
             if bn % 10 == 0:
@@ -260,21 +280,28 @@ def train_v5():
                 da_labeller.train()
                 ext_labeller.train()
                 # ------------------- Save the model OR Stop training ------------------- #
+                state = {
+                    'epoch': epoch, 'bn': bn,
+                    'training_step': training_step,
+                    'model': model.state_dict(),
+                    'da_labeller': da_labeller.state_dict(),
+                    'ext_labeller': ext_labeller.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'best_val_loss': best_val_loss
+                }
                 if avg_val_loss < best_val_loss:
                     stop_counter = 0
                     best_val_loss = avg_val_loss
                     best_epoch = epoch
 
-                    savepath = args['model_save_dir']+"model-{}-ep{}.pt".format(args['model_name'],epoch)
-                    savepath_da = args['model_save_dir']+"model-{}-ep{}.da.pt".format(args['model_name'],epoch)
-                    savepath_ext = args['model_save_dir']+"model-{}-ep{}.ext.pt".format(args['model_name'],epoch)
-
-                    torch.save(model.state_dict(), savepath)
-                    torch.save(da_labeller.state_dict(), savepath_da)
-                    torch.save(ext_labeller.state_dict(), savepath_ext)
+                    savepath = args['model_save_dir']+"model-{}-ep{}.pt".format(args['model_name'], 999) # 999 = best
+                    torch.save(state, savepath)
                     print("Model improved & saved at {}".format(savepath))
                 else:
                     print("Model not improved #{}".format(stop_counter))
+                    savepath = args['model_save_dir']+"model-{}-ep{}.pt".format(args['model_name'], 000) # 000 = current
+                    torch.save(state, savepath)
+                    print("Model NOT improved & saved at {}".format(savepath))
                     if stop_counter < VAL_STOP_TRAINING:
                         print("Just continue training ---- no loading old weights")
                         stop_counter += 1
@@ -283,6 +310,70 @@ def train_v5():
                         return
 
     print("End of training hierarchical RNN model")
+
+def diverisity_loss(u_attn_scores, dec_target, enc_len, dec_len):
+    batch_size = u_attn_scores.size(0)
+    if batch_size != 1: raise ValueError("only support batch_size = 1")
+
+    enc_len = enc_len[0].item()
+    dec_len = dec_len[0].item()
+    attn_score = u_attn_scores[0,:dec_len,:enc_len]
+
+    dec_sep_pos = []
+    for i, v in enumerate(dec_target):
+        if i == dec_len: break
+        if v == 102: dec_sep_pos.append(i)
+
+    if len(dec_sep_pos) == 0: dec_sep_pos.append(dec_len)
+    dec_start_pos = [0] + [x+1 for x in dec_sep_pos[:-1]]
+
+    num_dec_sentences = len(dec_sep_pos)
+    diverisity = [None for _ in range(num_dec_sentences)]
+    avg_attn   = [None for _ in range(num_dec_sentences)]
+
+    for j in range(num_dec_sentences):
+        _t1 = dec_start_pos[j]
+        _t2 = dec_sep_pos[j] + 1
+        attn_in_this_dec_sent = attn_score[_t1:_t2]
+
+        T, N = attn_in_this_dec_sent.size()
+        # ----------- intra-sentence ------------ #
+        count = 0
+        sum_div = 0
+        for t1 in range(T-1):
+            for t2 in range(t1+1, T):
+                # t2 = t1+1
+                p1 = attn_in_this_dec_sent[t1,:N]
+                p2 = attn_in_this_dec_sent[t2,:N]
+                # sum_div += torch.sqrt(((p1 - p2)**2).mean())
+                # gradient => nan
+                sum_div += ((p1 - p2)**2).mean()
+                count += 1
+        if count == 0 and T == 1:   d = 0
+        else:                       d = sum_div / count
+
+        diverisity[j] = d
+
+        # ----------- inter-sentence ------------ #
+        avg_attn[j] = attn_score[_t1:_t2].mean(dim=0)
+
+    count = 0
+    sum_div = 0
+    for j1 in range(num_dec_sentences-1):
+        # j2 = j1+1
+        for j2 in range(j1+1, num_dec_sentences):
+            p1 = avg_attn[j1]
+            p2 = avg_attn[j2]
+            # sum_div += torch.sqrt(((p1 - p2)**2).mean())
+            sum_div += ((p1 - p2)**2).mean()
+            count += 1
+
+    intra_sent_div = sum(diverisity) / len(diverisity)
+
+    if count > 0: inter_sent_div = sum_div / count
+    else:         inter_sent_div = 0
+
+    return intra_sent_div, inter_sent_div
 
 def compute_covloss(attn_scores, cov_scores):
     x = (attn_scores < cov_scores).float()
@@ -327,7 +418,7 @@ def evaluate(model, eval_data, eval_batch_size, args, device, use_rouge=False):
         decoder_target = decoder_target.view(-1)
         decoder_mask = decoder_mask.view(-1)
 
-        decoder_output, _, _, _ = model(input, u_len, w_len, target)
+        decoder_output, _, _, _, _ = model(input, u_len, w_len, target)
 
         if not use_rouge:
             loss = criterion(decoder_output.view(-1, args['vocab_size']), decoder_target)
@@ -354,7 +445,6 @@ def evaluate(model, eval_data, eval_batch_size, args, device, use_rouge=False):
 
         print("#", end="")
         sys.stdout.flush()
-
     print()
 
     if not use_rouge:
