@@ -97,6 +97,10 @@ class HierTokenizer(object):
         self.SEP_TOKEN  = '[SEP]'
         self.STOP_TOKEN = '[MASK]'
 
+    def set_len(self, num_utterances, num_words):
+        self.num_utterances = num_utterances
+        self.num_words      = num_words
+
     def get_enc_input(self, docs, use_gpu=False):
         batch_size = len(docs)
         input = np.zeros((batch_size, self.num_utterances, self.num_words), dtype=np.long)
@@ -112,6 +116,7 @@ class HierTokenizer(object):
             u_len[i] = num_sentences
 
             for j, sent in enumerate(sentences):
+                # BERT tokenizer (base-uncased) encode the same regardless of the case
                 token_ids = self.bert_tokenizer.encode(sent)[1:-1] # remove [CLS], [SEP]
                 utt_len = len(token_ids)
                 if utt_len > self.num_words:
@@ -135,6 +140,29 @@ class HierTokenizer(object):
 
         return batches
 
+    def get_dec_target(self, summaries, max_len=300, use_gpu=False):
+        batch_size = len(summaries)
+        target  = np.zeros((batch_size, max_len), dtype=np.long)
+        target.fill(103)
+        tgt_len = np.zeros((batch_size), dtype=np.int)
+        for i, summary in enumerate(summaries):
+            concat_tokens = [101]
+            sentences = tokenize.sent_tokenize(summary)
+            for j, sent in enumerate(sentences):
+                token_ids = self.bert_tokenizer.encode(sent)[1:-1] # remove [CLS], [SEP]
+                concat_tokens.extend(token_ids)
+                concat_tokens.extend([102]) # [SEP]
+            tl = len(concat_tokens)
+            if tl > max_len:
+                concat_tokens = concat_tokens[:max_len]
+                tl = max_len
+            target[i, :tl] = concat_tokens
+            tgt_len[i] = tl
+        target = torch.from_numpy(target)
+        if use_gpu:
+            target = target.cuda()
+        return target, tgt_len
+
     def tgtids2summary(self, tgt_ids):
         # tgt_ids = a row of numpy array containing token ids
         bert_decoded = self.bert_tokenizer.decode(tgt_ids)
@@ -145,8 +173,9 @@ class HierTokenizer(object):
         return summary
 
 class HierarchicalModel(object):
-    def __init__(self, model_name, use_gpu=False):
-        if model_name not in ["HIER", "HIERDIV"]: raise ValueError("model name not exist")
+    def __init__(self, model_name, model_step=None, use_gpu=False):
+        # if model_name not in ["HIER", "HIERDIV", "AMI_MT_DIV", "SPOTIFY_short", "SPOTIFY_long"]:
+        #     raise ValueError("model name not exist")
 
         if model_name == "HIER":
             self.model_path = "/home/alta/summary/pm574/summariser1/lib/trained_models2/model-HGRUV5_CNNDM_FEB26A-ep17.pt"
@@ -154,6 +183,22 @@ class HierarchicalModel(object):
         elif model_name == "HIERDIV":
             self.model_path = "/home/alta/summary/pm574/summariser1/lib/trained_models2/model-HGRUV5_CNNDMDIV_APR14A-ep02.pt"
             self.load_option = 2
+        elif model_name == "AMI_MT_DIV":
+            self.model_path = "/home/alta/summary/pm574/summariser1/lib/trained_models2/model-HGRUV5_APR12ALL100-ep20.pt"
+            self.load_option = 1
+
+        elif model_name == "SPOTIFY_short":
+            self.model_path = "/home/alta/summary/pm574/summariser1/lib/trained_models_spotify/HGRUV5DIV_SPOTIFY_JUNE18_v4-step{}.pt".format(model_step)
+            self.load_option = 2
+
+        elif model_name == "SPOTIFY_long":
+            self.model_path = "/home/alta/summary/pm574/summariser1/lib/trained_models_spotify/HGRUV5DIV_SPOTIFY_JUNE18_v3-step{}.pt".format(model_step)
+            self.load_option = 2
+
+        else:
+            self.model_path = model_name
+            self.load_option = 2 # new version
+
         args = {}
         args['vocab_size']      = 30522 # BERT tokenizer
         args['embedding_dim']   = 256   # word embeeding dimension
@@ -179,7 +224,8 @@ class HierarchicalModel(object):
                     self.model.load_state_dict(model_state_dict)
                 print("load succesful #1")
             except:
-                model_state_dict = torch.load(self.model_path)
+                if self.load_option == 1:
+                    model_state_dict = torch.load(self.model_path)
                 new_model_state_dict = OrderedDict()
                 for key in model_state_dict.keys():
                     new_model_state_dict[key.replace("module.","")] = model_state_dict[key]
@@ -195,7 +241,9 @@ class HierarchicalModel(object):
                     self.model.load_state_dict(model_state_dict)
                 print("load succesful #3")
             except:
-                model_state_dict = torch.load(self.model_path, map_location=torch.device('cpu'))
+                if self.load_option == 1:
+                    model_state_dict = torch.load(self.model_path, map_location=torch.device('cpu'))
+
                 new_model_state_dict = OrderedDict()
                 for key in model_state_dict.keys():
                     new_model_state_dict[key.replace("module.","")] = model_state_dict[key]
@@ -231,6 +279,41 @@ class HierarchicalModel(object):
             summary_id, _, _ = self.model.decode_beamsearch(input, u_len, w_len, decode_dict)
         return summary_id
 
+    def get_utt_attn_with_ref(self, enc_batch, target, tgt_len):
+        # batch_size should be 1
+        with torch.no_grad():
+            # Teacher Forcing
+            _, _, _, _, u_attn_scores = self.model(enc_batch.input, enc_batch.u_len, enc_batch.w_len, target)
+        N = enc_batch.u_len[0].item()
+        T = tgt_len[0].item()
+        attention = u_attn_scores[0, :T, :N].sum(dim=0) / u_attn_scores[0, :T, :N].sum()
+        attention = attention.cpu().numpy()
+        return attention
+
+    def get_utt_attn_without_ref(self, enc_batch, beam_width=4, time_step=144, penalty_ug=0.0, alpha=1.25, length_offset=5):
+        decode_dict = {
+            'k': beam_width,
+            'time_step': time_step,
+            'vocab_size': 30522,
+            'device': self.device,
+            'start_token_id': 101, 'stop_token_id': 103,
+            'alpha': alpha,
+            'length_offset': length_offset,
+            'penalty_ug': penalty_ug,
+            'keypadmask_dtype': KEYPADMASK_DTYPE,
+            'memory_utt': False,
+            'batch_size': 1
+        }
+        # batch_size should be 1
+        with torch.no_grad():
+
+            summary_ids, attn_scores, u_attn_scores = self.model.decode_beamsearch(
+                    enc_batch.input, enc_batch.u_len, enc_batch.w_len, decode_dict)
+
+        N = enc_batch.u_len[0].item()
+        attention = u_attn_scores[:,:N].sum(dim=0) / u_attn_scores[:,:N].sum()
+        attention = attention.cpu().numpy()
+        return attention
 def test():
 
     model = HierarchicalModel("HIERDIV", use_gpu=True)
